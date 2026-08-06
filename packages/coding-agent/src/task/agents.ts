@@ -4,8 +4,9 @@
  * Agents are embedded at build time via Bun's import with { type: "text" }.
  */
 import { Effort } from "@oh-my-pi/pi-ai";
-import { parseFrontmatter, prompt } from "@oh-my-pi/pi-utils";
+import { logger, parseFrontmatter, prompt } from "@oh-my-pi/pi-utils";
 import { parseAgentFields } from "../discovery/helpers";
+import type { Skill } from "../extensibility/skills";
 import designerMd from "../prompts/agents/designer.md" with { type: "text" };
 // Embed agent markdown files at build time
 import agentFrontmatterTemplate from "../prompts/agents/frontmatter.md" with { type: "text" };
@@ -164,6 +165,52 @@ export function getBundledAgentsMap(): Map<string, AgentDefinition> {
  */
 export function clearBundledAgentsCache(): void {
 	bundledAgentsCache = null;
+}
+
+/**
+ * Resolve the skill list handed to a subagent session, applying the agent's
+ * per-role visibility frontmatter (`skills` allowlist, `hideSkills` denylist,
+ * `unhideSkills` source-hide override).
+ *
+ * Visibility controls the rendered `<skills>` block only — skills are never
+ * dropped, so `skill://<name>` and `/skill:<name>` stay reachable. Since the
+ * child prompt renderer re-filters `hide !== true`, listing-hidden skills are
+ * marked `hide: true` on the copies and `unhideSkills` clears the flag.
+ *
+ * Precedence per skill (deny wins):
+ *  1. `hideSkills` glob match → hidden (beats allowlist and `unhideSkills`);
+ *  2. `skills` allowlist present and no match → hidden;
+ *  3. source `hide: true` and no `unhideSkills` match → hidden;
+ *  4. otherwise → listed.
+ */
+export function resolveAgentSkills(
+	sessionSkills: readonly Skill[],
+	agent: Pick<AgentDefinition, "skills" | "hideSkills" | "unhideSkills">,
+): Skill[] {
+	const allowlist = agent.skills;
+	const deny = agent.hideSkills;
+	const unhide = agent.unhideSkills;
+	const matches = (patterns: string[] | undefined, name: string): boolean => {
+		if (!patterns?.length) return false;
+		return patterns.some(pattern => {
+			try {
+				return new Bun.Glob(pattern).match(name);
+			} catch {
+				logger.warn("Invalid skill glob in agent frontmatter", { pattern });
+				return false;
+			}
+		});
+	};
+	return sessionSkills.map(skill => {
+		const listed =
+			!matches(deny, skill.name) &&
+			(allowlist === undefined || matches(allowlist, skill.name)) &&
+			(skill.hide !== true || matches(unhide, skill.name));
+		if (listed) {
+			return skill.hide === true ? { ...skill, hide: false } : skill;
+		}
+		return skill.hide === true ? skill : { ...skill, hide: true };
+	});
 }
 
 // Re-export for backward compatibility

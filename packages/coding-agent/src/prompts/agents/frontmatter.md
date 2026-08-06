@@ -8,5 +8,8 @@ description: {{jsonStringify description}}
 {{/if}}{{#if blocking}}blocking: true
 {{/if}}{{#if prewalk}}prewalk: {{jsonStringify prewalk}}
 {{/if}}{{#if autoloadSkills}}autoloadSkills: {{jsonStringify autoloadSkills}}
+{{/if}}{{#if skills}}skills: {{jsonStringify skills}}
+{{/if}}{{#if hideSkills}}hideSkills: {{jsonStringify hideSkills}}
+{{/if}}{{#if unhideSkills}}unhideSkills: {{jsonStringify unhideSkills}}
 {{/if}}---
 {{body}}
