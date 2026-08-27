@@ -6,6 +6,7 @@
  */
 import * as fsSync from "node:fs";
 import * as os from "node:os";
+import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
@@ -34,8 +35,10 @@ import { ModelRegistry } from "./config/model-registry";
 import {
 	DEFAULT_PREWALK_TARGET,
 	expandRoleAlias,
+	extractExplicitThinkingSelector,
 	getModelMatchPreferences,
 	resolveCliModel,
+	resolveModelOverride,
 	resolveModelRoleValue,
 	resolveModelScope,
 	type ScopedModel,
@@ -88,10 +91,14 @@ import { SessionManager } from "./session/session-manager";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { shouldShowStartupSplash } from "./startup-splash";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "./system-prompt";
+import { resolveAgentSessionPolicy } from "./task/agent-policy";
+import { discoverAgents, getAgent } from "./task/discovery";
 import { createPersistedSubagentReviverFactory } from "./task/persisted-revive";
+import type { AgentDefinition } from "./task/types";
 import { createTelemetryExportConfig, initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
 import { concreteThinkingLevel, parseConfiguredThinkingLevel } from "./thinking";
 import type { LspStartupServerInfo } from "./tools";
+import { expandTilde } from "./tools/path-utils";
 import { getChangelogPath, resolveStartupChangelogForDisplay, type StartupChangelogSelection } from "./utils/changelog";
 import { EventBus } from "./utils/event-bus";
 import { withTimeoutSignal } from "./utils/fetch-timeout";
@@ -359,7 +366,10 @@ export interface AcpSessionFactoryOptions {
 	sessionDir?: string;
 	authStorage: AuthStorage;
 	modelRegistry: ModelRegistry;
-	parsedArgs: Pick<Args, "apiKey" | "trustedExtensions">;
+	parsedArgs: Pick<
+		Args,
+		"apiKey" | "trustedExtensions" | "agent" | "extensions" | "hooks" | "noExtensions" | "model" | "thinking"
+	>;
 	rawArgs: string[];
 	createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
 }
@@ -416,8 +426,76 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 				`Trusted extension failed to load: ${trustedExtensions.errors.map(item => item.error).join("; ")}`,
 			);
 		}
+		// `baseOptions.agentPersona` (and the model/tool/spawns derived from it)
+		// was resolved against the LAUNCH cwd. An ACP host can open `session/new`
+		// for a different workspace, and the persona's project `.agent.md` (or a
+		// shadowing definition in the target project) must resolve under the
+		// session cwd, not the launch one. Re-resolve an explicit --agent here;
+		// rehydrated personas (no --agent) keep the baked definition, matching
+		// the launch resume path (codex 3742806342). The launch-cwd persona
+		// fields are cleared FIRST so a target workspace that cannot resolve the
+		// --agent (or resolves a definition without the launch persona's
+		// model/tools) does not run the stale launch persona policy; CLI-locked
+		// selections (--tools/--model/--thinking) survive untouched (codex
+		// 3742931876).
+		const baseOptions = { ...args.baseOptions };
+		const cliAgent = args.parsedArgs.agent;
+		if (cliAgent && baseOptions.agentPersona) {
+			baseOptions.agentPersona = undefined;
+			if (!baseOptions.cliToolsLocked) {
+				baseOptions.toolNames = undefined;
+				baseOptions.toolNamesFromAgent = undefined;
+			}
+			if (!baseOptions.cliModelLocked) {
+				baseOptions.model = undefined;
+				baseOptions.modelPattern = undefined;
+			}
+			if (!baseOptions.cliThinkingLocked) {
+				baseOptions.thinkingLevel = undefined;
+			}
+			const cliExtensionPaths = [...(args.parsedArgs.extensions ?? []), ...(args.parsedArgs.hooks ?? [])];
+			const agentExtensionMode: "merge" | "explicit-only" = args.parsedArgs.noExtensions ? "explicit-only" : "merge";
+			const agentIncludeExtensions = !args.parsedArgs.noExtensions || cliExtensionPaths.length > 0;
+			// Explicit extension-package ROOTS (distinct from entry files) mirror
+			// the SDK's toolSession.extensionRoots derivation (sdk.ts:2177): what
+			// additionalExtensionPaths named, resolved against the target cwd with
+			// tilde expansion. Without them an SDK embedder that passes extension
+			// packages (not CLI -e flags) would silently miss extension-shipped
+			// agents here and fall back to the default persona.
+			const explicitRoots = (baseOptions.additionalExtensionPaths ?? []).map(raw =>
+				path.resolve(cwd, expandTilde(raw)),
+			);
+			const acpExtensionRoots = baseOptions.preloadedExtensionRoots ?? explicitRoots;
+			const discovery = await discoverAgents(cwd, undefined, {
+				includeExtensions: agentIncludeExtensions,
+				extensionMode: agentExtensionMode,
+				extensionRoots: acpExtensionRoots,
+			});
+			const agentPersona = getAgent(discovery.agents, cliAgent);
+			if (agentPersona && agentPersona.availability !== "subagent") {
+				baseOptions.agentPersona = agentPersona;
+				const policy = resolveAgentSessionPolicy(agentPersona);
+				// Re-derive the persona's tool/model/thinking policy for the
+				// target project (the SDK's sdk.ts:1408 persona block resolves
+				// the deferred model pattern after extensions register for this
+				// cwd).
+				if (!baseOptions.cliToolsLocked && policy.toolNames) {
+					baseOptions.toolNames = policy.toolNames;
+					baseOptions.toolNamesFromAgent = true;
+				}
+				if (!baseOptions.cliModelLocked && policy.modelPatterns?.length) {
+					baseOptions.modelPattern = policy.modelPatterns;
+				}
+				if (!baseOptions.cliThinkingLocked && policy.thinkingLevel) {
+					baseOptions.thinkingLevel = policy.thinkingLevel;
+				}
+			}
+			// Unresolved or subagent-only: silent fallback to the default
+			// session (matching the launch resume path) — the persona fields
+			// stay cleared.
+		}
 		const { session: nextSession } = await args.createSession({
-			...args.baseOptions,
+			...baseOptions,
 			cwd,
 			sessionManager: nextSessionManager,
 			settings: nextSettings,
@@ -938,12 +1016,69 @@ export async function buildSessionOptions(
 			parsed.systemPrompt !== undefined ||
 			parsed.appendSystemPrompt !== undefined ||
 			parsed.tools !== undefined ||
+			parsed.agent !== undefined ||
 			parsed.noTools === true;
 		if (!forkCacheShapeChanged && header?.providerPromptCacheKey) {
 			options.providerPromptCacheKey = header.providerPromptCacheKey;
 			options.providerPromptCacheKeySource = "fork";
 		}
 	}
+
+	// Agent persona selection (--agent) — must be before model resolution
+	// so agentPolicy is available for the agent model else-if branch.
+	let agentPersona: AgentDefinition | undefined;
+	const disabledAgents = new Set((activeSettings.get("task.disabledAgents") as string[] | undefined) ?? []);
+	// --no-extensions suppresses ambient agent roots (settings/installed/marketplace
+	// extensions) but keeps explicitly-requested -e/--hook roots discoverable via
+	// listOmpExtensionRoots' explicit-only mode (injectedCliRootMode set in
+	// runRootCommand), matching how the rest of startup treats extension packages.
+	const cliExtensionPaths = [...(parsed.extensions ?? []), ...(parsed.hooks ?? [])];
+	const agentExtensionMode: "merge" | "explicit-only" = parsed.noExtensions ? "explicit-only" : "merge";
+	const agentIncludeExtensions = !parsed.noExtensions || cliExtensionPaths.length > 0;
+	if (parsed.agent) {
+		const discovery = await discoverAgents(options.cwd ?? getProjectDir(), undefined, {
+			includeExtensions: agentIncludeExtensions,
+			extensionMode: agentExtensionMode,
+		});
+		agentPersona = getAgent(discovery.agents, parsed.agent);
+		if (!agentPersona) {
+			const available = discovery.agents.map(a => a.name).join(", ") || "none";
+			throw new Error(`Unknown agent "${parsed.agent}". Available: ${available}`);
+		}
+		if (disabledAgents.has(parsed.agent)) {
+			throw new Error(`Agent "${parsed.agent}" is disabled in settings (task.disabledAgents).`);
+		}
+		if (agentPersona.availability === "subagent") {
+			throw new Error(`Agent "${parsed.agent}" is subagent-only and cannot be selected as main persona.`);
+		}
+	}
+
+	// Resume: re-resolve agent from persisted session context
+	// --agent CLI flag takes precedence (the !parsed.agent guard ensures this).
+	const sessionContext = sessionManager?.buildSessionContext();
+	if (!parsed.agent && sessionContext) {
+		if (sessionContext.agentPersona) {
+			const { agent: name, source } = sessionContext.agentPersona;
+			const discovery = await discoverAgents(options.cwd ?? getProjectDir(), undefined, {
+				includeExtensions: agentIncludeExtensions,
+				extensionMode: agentExtensionMode,
+			});
+			// Prefer source-stable match, fall back to name-only (e.g. if source was deleted)
+			const agent =
+				discovery.agents.find(a => a.name === name && a.source === source) ?? getAgent(discovery.agents, name);
+			if (agent && agent.availability !== "subagent" && !disabledAgents.has(agent.name)) {
+				agentPersona = agent;
+			}
+			// If agent .md was deleted or changed to subagent-only, silently fall back to default main
+		}
+	}
+
+	// Rehydrated from session context: the persona's model/thinking must not
+	// override what the transcript records. An explicit --agent on a resume
+	// is a fresh selection and MAY apply its frontmatter (unless --model/--thinking).
+	const agentRehydratedFromContext = !parsed.agent && Boolean(sessionContext?.agentPersona);
+
+	const agentPolicy = agentPersona ? resolveAgentSessionPolicy(agentPersona) : undefined;
 
 	// Model from CLI
 	// - supports --provider <name> --model <pattern>
@@ -953,7 +1088,17 @@ export async function buildSessionOptions(
 	// createAgentSession's post-extension re-resolution (issue #6694); the
 	// scoped thinking-level seed below must be deferred along with the model.
 	let deferredDefaultRole = false;
+	// True when the persona's own model pattern could not resolve before
+	// extensions register (provider/model shipped by an extension) and the
+	// startup scope is settings-derived: `options.model` is left unset so
+	// createAgentSession's post-extension deferred-model block retries the
+	// patterns (sdk.ts:1408) instead of pinning the remembered/scoped fallback
+	// and blocking that retry. Under an explicit CLI `--models` scope deferral
+	// would let the persona model escape the allow-list (createAgentSession
+	// never sees CLI `--models`), so the first scoped model is pinned there.
+	let personaDeferred = false;
 	if (parsed.model) {
+		options.cliModelLocked = true;
 		const resolved = resolveCliModel({
 			cliProvider: parsed.provider,
 			cliModel: parsed.model,
@@ -969,11 +1114,30 @@ export async function buildSessionOptions(
 		if (matchedAfterMissingRolePattern) {
 			// Extensions may register an earlier configured role candidate.
 			options.modelPattern = parsed.model;
+			// Preserve an inline `:<level>` suffix through deferral so the
+			// explicit CLI thinking choice is not clobbered by persona default
+			// thinking (createAgentSession prefers options.thinkingLevel over a
+			// persona's frontmatter level).
+			if (!parsed.thinking) {
+				const inlineThinking = extractExplicitThinkingSelector(parsed.model, activeSettings);
+				if (inlineThinking) {
+					options.thinkingLevel = inlineThinking;
+					options.cliThinkingLocked = true;
+				}
+			}
 		} else if (resolved.error) {
 			if (!parsed.provider && ((resolved.configuredPatterns?.length ?? 0) > 0 || !parsed.model.includes(":"))) {
 				// Model not found in built-in registry — defer resolution to after extensions load
 				// (extensions may register additional providers/models via registerProvider)
 				options.modelPattern = parsed.model;
+				// Preserve an inline `:<level>` suffix through deferral (see above).
+				if (!parsed.thinking) {
+					const inlineThinking = extractExplicitThinkingSelector(parsed.model, activeSettings);
+					if (inlineThinking) {
+						options.thinkingLevel = inlineThinking;
+						options.cliThinkingLocked = true;
+					}
+				}
 			} else {
 				process.stderr.write(`${chalk.red(resolved.error)}\n`);
 				process.exit(1);
@@ -985,11 +1149,36 @@ export async function buildSessionOptions(
 			});
 			if (!parsed.thinking && resolved.thinkingLevel) {
 				options.thinkingLevel = resolved.thinkingLevel;
+				// An inline thinking suffix on --model (e.g. `--model gpt-5:low`) is
+				// an explicit thinking choice: lock it so a persona's thinkingLevel
+				// frontmatter or a later persona switch cannot clobber it.
+				options.cliThinkingLocked = true;
 			}
 		}
 	} else if (scopedModels.length > 0 && !restoringSession) {
+		// Agent persona model takes precedence over the remembered scoped default:
+		// the persona is an explicit selection, so its model frontmatter wins
+		// unless the user picked a model with --model (resolved above). Only when
+		// the persona has no model do we fall back to the remembered default.
+		if (agentPolicy?.modelPatterns?.length && !agentRehydratedFromContext) {
+			const resolved = resolveModelOverride(agentPolicy.modelPatterns, modelRegistry, activeSettings);
+			if (resolved.model) {
+				options.model = resolved.model;
+				if (resolved.thinkingLevel && !agentPolicy.thinkingLevel) {
+					options.thinkingLevel = resolved.thinkingLevel;
+				}
+			} else {
+				// Unresolved before extensions register: defer (settings-derived
+				// scope only; an explicit CLI scope is pinned below).
+				personaDeferred = true;
+			}
+			if (resolved.warning) {
+				process.stderr.write(`${chalk.yellow(`Warning: ${resolved.warning}`)}
+`);
+			}
+		}
 		const remembered = activeSettings.getModelRole("default");
-		if (remembered) {
+		if (!options.model && !personaDeferred && remembered) {
 			const rememberedSpec = resolveModelRoleValue(
 				remembered,
 				scopedModels.map(scopedModel => scopedModel.model),
@@ -1025,9 +1214,24 @@ export async function buildSessionOptions(
 		// Defer ONLY for a settings-derived scope: createAgentSession re-resolves
 		// against `settings.enabledModels` and never sees CLI `--models`, so
 		// deferring under an explicit CLI scope would let the saved default
-		// escape it — keep pinning the first scoped model there.
-		deferredDefaultRole = !options.model && Boolean(remembered) && !((parsed.models?.length ?? 0) > 0);
-		if (!options.model && !deferredDefaultRole) options.model = scopedModels[0].model;
+		// escape it — keep pinning the first scoped model there. A deferred
+		// PERSONA model defers under either scope: the persona is an explicit
+		// selection like --model (whose deferral is scope-agnostic), and the
+		// SDK's persona deferral block (sdk.ts:1408) is the canonical mechanism.
+		deferredDefaultRole =
+			!options.model && !personaDeferred && Boolean(remembered) && !((parsed.models?.length ?? 0) > 0);
+		if (!options.model && !personaDeferred && !deferredDefaultRole) options.model = scopedModels[0].model;
+	} else if (agentPolicy?.modelPatterns && agentPolicy.modelPatterns.length > 0 && !agentRehydratedFromContext) {
+		const resolved = resolveModelOverride(agentPolicy.modelPatterns, modelRegistry, activeSettings);
+		if (resolved.model) {
+			options.model = resolved.model;
+			if (resolved.thinkingLevel && !agentPolicy.thinkingLevel) {
+				options.thinkingLevel = resolved.thinkingLevel;
+			}
+		}
+		if (resolved.warning) {
+			process.stderr.write(`${chalk.yellow(`Warning: ${resolved.warning}`)}\n`);
+		}
 	}
 
 	if (parsed.noPrewalk && (parsed.prewalk || parsed.prewalkInto !== undefined)) {
@@ -1084,6 +1288,7 @@ export async function buildSessionOptions(
 	// Thinking level
 	if (parsed.thinking) {
 		options.thinkingLevel = parsed.thinking;
+		options.cliThinkingLocked = true;
 	} else if (
 		scopedModels.length > 0 &&
 		scopedModels[0].explicitThinkingLevel === true &&
@@ -1094,6 +1299,8 @@ export async function buildSessionOptions(
 		!restoringSession
 	) {
 		options.thinkingLevel = scopedModels[0].thinkingLevel;
+	} else if (agentPolicy?.thinkingLevel && !agentRehydratedFromContext && options.thinkingLevel === undefined) {
+		options.thinkingLevel = agentPolicy.thinkingLevel;
 	}
 
 	// Scoped models for Ctrl+P cycling - fill in default thinking levels when not explicit
@@ -1127,8 +1334,13 @@ export async function buildSessionOptions(
 	// Tools
 	if (parsed.noTools) {
 		options.toolNames = parsed.tools && parsed.tools.length > 0 ? parsed.tools : [];
+		options.cliToolsLocked = true;
 	} else if (parsed.tools) {
 		options.toolNames = parsed.tools;
+		options.cliToolsLocked = true;
+	} else if (agentPolicy?.toolNames) {
+		options.toolNames = agentPolicy.toolNames;
+		options.toolNamesFromAgent = true;
 	}
 
 	if (parsed.noLsp) {
@@ -1176,6 +1388,10 @@ export async function buildSessionOptions(
 		if (parsed.noExtensions) {
 			options.disableExtensionDiscovery = true;
 		}
+	}
+
+	if (agentPersona) {
+		options.agentPersona = agentPersona;
 	}
 
 	return options;

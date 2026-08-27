@@ -204,6 +204,135 @@ describe("generate_image tool gating", () => {
 		expect(session.getActiveToolNames()).not.toContain("write");
 	});
 
+	it("keeps deferred MCP tool refreshes inside the persona tool policy", async () => {
+		const mcpTool = customTool("mcp__test__search", true);
+		// No startup custom tools: the MCP server connects after the persona is
+		// applied, so the deferred refresh must not broaden the active set.
+		const { session } = await createAgentSession({
+			cwd: registryDir,
+			agentDir: registryDir,
+			enableMCP: false,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "plan.enabled": false }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			agentPersona: {
+				name: "readonly-persona",
+				description: "Persona granting only read",
+				systemPrompt: "",
+				tools: ["read"],
+				source: "project" as const,
+			},
+		});
+		sessions.push(session);
+
+		// The persona overlay is active pre-refresh.
+		expect(session.getEnabledToolNames()).toContain("read");
+		expect(session.getEnabledToolNames()).not.toContain(mcpTool.name);
+
+		// A deferred MCP connect must not broaden the catalog past the persona's
+		// explicit tools (codex 3741691577): the tool is registered (visible for
+		// a future switch) but stays OUT of the active set.
+		await session.refreshMCPTools([mcpTool]);
+		expect(session.getAllToolNames()).toContain(mcpTool.name);
+		expect(session.getEnabledToolNames()).not.toContain(mcpTool.name);
+	});
+
+	it("does not install the persona tool policy when the CLI locked the tool set", async () => {
+		const mcpTool = customTool("mcp__test__search", true);
+		// --agent reviewer --tools read,mcp__test__search: the CLI list wins, so
+		// a deferred MCP refresh must not filter the CLI-granted MCP tool against
+		// the persona's own tools (codex 3741730337).
+		const { session } = await createAgentSession({
+			cwd: registryDir,
+			agentDir: registryDir,
+			enableMCP: false,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "plan.enabled": false }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			toolNames: ["read", mcpTool.name],
+			cliToolsLocked: true,
+			agentPersona: {
+				name: "restricted-persona",
+				description: "Persona whose own tools would exclude the MCP tool",
+				systemPrompt: "",
+				tools: ["read"],
+				source: "project" as const,
+			},
+		});
+		sessions.push(session);
+
+		await session.refreshMCPTools([mcpTool]);
+
+		// The CLI-granted MCP tool stays active: no persona filter is installed.
+		expect(session.getEnabledToolNames()).toContain(mcpTool.name);
+	});
+
+	it("does not install the persona tool policy when the SDK caller granted the tool set", async () => {
+		const mcpTool = customTool("mcp__sdk__search", true);
+		// SDK embedder passes agentPersona together with an explicit toolNames
+		// list but does NOT set cliToolsLocked: startup respects the explicit
+		// list (the SDK persona block only fills toolNames when undefined), so a
+		// deferred MCP refresh must not filter the explicitly granted host tool
+		// against the persona's own tools either (codex 3743142).
+		const { session } = await createAgentSession({
+			cwd: registryDir,
+			agentDir: registryDir,
+			enableMCP: false,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "plan.enabled": false }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			toolNames: ["read", mcpTool.name],
+			agentPersona: {
+				name: "restricted-sdk-persona",
+				description: "Persona whose own tools would exclude the SDK-granted MCP tool",
+				systemPrompt: "",
+				tools: ["read"],
+				source: "project" as const,
+			},
+		});
+		sessions.push(session);
+
+		await session.refreshMCPTools([mcpTool]);
+
+		// The SDK-granted MCP tool stays active: no persona filter is installed.
+		expect(session.getEnabledToolNames()).toContain(mcpTool.name);
+	});
+
+	it("filters startup always-include tools through the persona tool policy", async () => {
+		const ambientTool = customTool("ambient_write_like", false);
+		// Persona grants only `read`; an SDK custom tool would normally be
+		// always-included at startup. It must stay registered but OUT of the
+		// initial active set (codex 3741730336).
+		const { session } = await createAgentSession({
+			cwd: registryDir,
+			agentDir: registryDir,
+			enableMCP: false,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "plan.enabled": false }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			customTools: [ambientTool],
+			agentPersona: {
+				name: "readonly-persona-2",
+				description: "Persona granting only read",
+				systemPrompt: "",
+				tools: ["read"],
+				source: "project" as const,
+			},
+		});
+		sessions.push(session);
+
+		expect(session.getAllToolNames()).toContain(ambientTool.name);
+		expect(session.getEnabledToolNames()).not.toContain(ambientTool.name);
+	});
+
 	it("preserves explicitly requested write after MCP devices disconnect", async () => {
 		const session = await sessionWithCustomTools(["read", "write"], [customTool("mcp__test__search", true)]);
 
@@ -344,5 +473,44 @@ describe("generate_image tool gating", () => {
 		expect(session.getActiveToolNames()).toContain("rpc_search");
 		expect(session.getActiveToolNames()).not.toContain("write");
 		expect(session.getXdevToolEntries()).toEqual([]);
+	});
+
+	it("filters deferred RPC host tools through the persona tool policy", async () => {
+		const { session } = await createAgentSession({
+			cwd: registryDir,
+			agentDir: registryDir,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "plan.enabled": false, "generate_image.enabled": false }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			enableMCP: false,
+			agentPersona: {
+				name: "readonly-rpc-persona",
+				description: "Persona granting only read",
+				systemPrompt: "",
+				tools: ["read"],
+				source: "project" as const,
+			},
+		});
+		sessions.push(session);
+
+		const rpcTool: AgentTool = {
+			name: "rpc_write_like",
+			label: "RPC Write Like",
+			description: "Write-like RPC host tool",
+			parameters: type({}),
+			loadMode: "discoverable",
+			async execute() {
+				return { content: [] };
+			},
+		};
+		await session.refreshRpcHostTools([rpcTool]);
+
+		// The persona grants only read: a deferred host set_host_tools must not
+		// auto-activate a write-like tool past the policy (codex 3741758358),
+		// mirroring the MCP refresh gate.
+		expect(session.getAllToolNames()).toContain(rpcTool.name);
+		expect(session.getEnabledToolNames()).not.toContain(rpcTool.name);
 	});
 });

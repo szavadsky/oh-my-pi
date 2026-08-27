@@ -37,12 +37,15 @@ export function createMCPTimeout(
 	signal?: AbortSignal;
 	clear: () => void;
 	isTimeoutAbort: (error: unknown) => boolean;
+	/** True when this operation's own timer fired (regardless of what error a consumer saw). */
+	timedOut: () => boolean;
 } {
 	if (!isMCPTimeoutEnabled(timeoutMs)) {
 		return {
 			signal,
 			clear: () => {},
 			isTimeoutAbort: () => false,
+			timedOut: () => false,
 		};
 	}
 
@@ -55,5 +58,6 @@ export function createMCPTimeout(
 		clear: () => clearTimeout(timeoutId),
 		isTimeoutAbort: error =>
 			error instanceof Error && error.name === "AbortError" && abortController.signal.aborted && !signal?.aborted,
+		timedOut: () => abortController.signal.aborted && !signal?.aborted,
 	};
 }

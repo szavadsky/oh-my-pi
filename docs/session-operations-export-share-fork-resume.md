@@ -317,6 +317,16 @@ For compatibility, `--continue <full-UUID>` is normalized to `--resume <UUID>` w
 
 This is startup-only behavior; there is no interactive `/continue` slash command.
 
+### Agent persona recovery on resume/continue/fork
+
+When a resumed (or `--continue`d or forked) transcript recorded an agent persona (`agent_change` entry), startup **re-resolves the persona by name** against the *current* agent discovery set — not against the exact definition that was saved. This is intentional: a resume re-materializes the session under the **current configuration and tool shape** of that agent, so updated frontmatter (tools, model, thinking, spawns) applies to the resumed session. Consequences:
+
+- If the agent file changed since the session was saved, the resumed session picks up the new definition.
+- If the agent was deleted (or changed to `mode: subagent`/`disable-model-invocation`), the persona silently falls back to the default main agent.
+- If a same-named agent now exists at a higher-precedence root (project `.omp` over user `~/.omp`, bundled last), the higher-precedence definition wins; identity is by name, not by file path.
+- An explicit `--agent <name>` on resume is a fresh selection and **overrides** the persisted persona entirely, including applying that agent's model/thinking frontmatter (unless `--model`/`--thinking` are passed); a persona recovered from the transcript never overrides the transcript's own model/thinking entries.
+- The persisted persona name is updated when an explicit `--agent` selection is made on a resumed/continued/forked transcript, so the next resume recovers the new persona.
+
 ## How session switching actually mutates runtime state
 
 `AgentSession.switchSession(sessionPath)` does the runtime transition used by resume-like operations:

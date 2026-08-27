@@ -72,6 +72,8 @@ export interface SessionContext {
 	mode: string;
 	/** Mode-specific data from the last mode_change entry */
 	modeData?: Record<string, unknown>;
+	/** Agent persona from the latest agent_change entry, for resume re-resolution. */
+	agentPersona?: { agent: string; source: "bundled" | "user" | "project"; fingerprint?: string };
 	/**
 	 * Array parallel to messages, indicating which assistant turns should
 	 * have their prompt-cache misses suppressed/explained (because a model,
@@ -280,6 +282,20 @@ export function buildSessionContext(
 		} else if (entry.type === "mode_change") {
 			mode = entry.mode;
 			modeData = entry.data;
+		}
+	}
+
+	// Extract latest agent_change entry (scan last-to-first for most recent)
+	let agentPersona: { agent: string; source: "bundled" | "user" | "project"; fingerprint?: string } | undefined;
+	for (let i = path.length - 1; i >= 0; i--) {
+		const entry = path[i];
+		if (entry.type === "agent_change") {
+			agentPersona = {
+				agent: entry.agent,
+				source: entry.source,
+				...(entry.fingerprint !== undefined ? { fingerprint: entry.fingerprint } : {}),
+			};
+			break;
 		}
 	}
 
@@ -578,5 +594,6 @@ export function buildSessionContext(
 		injectedTtsrRules,
 		mode,
 		modeData,
+		agentPersona,
 	};
 }

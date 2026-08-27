@@ -14,6 +14,7 @@ import { buildSessionOptions as buildCliSessionOptions } from "@oh-my-pi/pi-codi
 import { createAgentSession, type ExtensionFactory } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 
 describe("createAgentSession deferred model pattern resolution", () => {
@@ -166,6 +167,159 @@ describe("createAgentSession deferred model pattern resolution", () => {
 
 		expect(session.model).toBeUndefined();
 		expect(modelFallbackMessage).toBe('Model "missing-provider/missing-model" not found');
+	});
+
+	test("defers an unresolved agentPersona model until extension providers register", async () => {
+		const authStorage = await AuthStorage.create(path.join(tempDir, "persona-auth.db"));
+		authStoragesToClose.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			authStorage,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			disableExtensionDiscovery: true,
+			extensions: [providerExtension],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			// The persona names a provider/model only the extension registers; the
+			// pre-extension resolution fails, so the patterns must be deferred and
+			// retried after registration instead of silently falling back to the
+			// previous/default model (thread sdk.ts:1404).
+			agentPersona: {
+				name: "extension-model-persona",
+				description: "Persona with an extension-provided model",
+				systemPrompt: "You are extension-model-persona.",
+				model: ["runtime-provider/runtime-model"],
+				source: "project" as const,
+			},
+		});
+
+		try {
+			expect(session.model?.provider).toBe("runtime-provider");
+			expect(session.model?.id).toBe("runtime-model");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("persists a deferred persona model resolution on a resumed transcript", async () => {
+		// Regression (codex 3743133859): when an explicit persona's model: only
+		// resolves after extension registration (options.modelPattern deferral),
+		// options.model stays undefined, so the resume-persistence guard skipped
+		// the model_change append. The next resume then treated the persona as
+		// rehydrated and restored the transcript's OLD model instead of the
+		// persona default this run actually used.
+		const authStorage = await AuthStorage.create(path.join(tempDir, "persona-resume-auth.db"));
+		authStoragesToClose.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		const sessionManager = SessionManager.inMemory();
+		// Existing transcript records a stale model; no agent_change yet, so the
+		// persona is a fresh selection whose pattern defers to post-extension.
+		sessionManager.appendModelChange("openai/gpt-4o-mini");
+		sessionManager.appendMessage({ role: "user", content: "prior turn", timestamp: Date.now() });
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			authStorage,
+			modelRegistry,
+			sessionManager,
+			disableExtensionDiscovery: true,
+			extensions: [providerExtension],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			agentPersona: {
+				name: "extension-model-persona",
+				description: "Persona with an extension-provided model",
+				systemPrompt: "You are extension-model-persona.",
+				model: ["runtime-provider/runtime-model"],
+				source: "project" as const,
+			},
+		});
+
+		try {
+			expect(session.model?.id).toBe("runtime-model");
+			// The deferred resolution must persist a model_change so the next
+			// resume rehydrates the persona model instead of the stale one.
+			const modelChanges = sessionManager.getEntries().filter(e => e.type === "model_change");
+			expect(modelChanges[modelChanges.length - 1].model).toBe("runtime-provider/runtime-model");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("defers an unresolved CLI persona model through the scoped branch instead of pinning the scoped fallback", async () => {
+		// Regression: the scoped-model branch previously pinned the remembered /
+		// first scoped model whenever the persona model failed the pre-extension
+		// resolution, which set options.model and blocked the SDK's later
+		// persona-model deferral. The persona must start on its declared model
+		// after the extension registers, not on the scoped fallback.
+		const authStorage = await AuthStorage.create(path.join(tempDir, "persona-scope-auth.db"));
+		authStoragesToClose.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		const scopedModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!scopedModel) throw new Error("expected bundled gpt-4o-mini");
+
+		const persona = {
+			name: "extension-model-persona",
+			description: "Persona with an extension-provided model",
+			systemPrompt: "You are extension-model-persona.",
+			model: ["runtime-provider/runtime-model"],
+			source: "project" as const,
+		};
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [persona],
+			projectAgentsDir: null,
+		});
+
+		const options = await buildCliSessionOptions(
+			parseArgs(["--agent", "extension-model-persona"]),
+			[{ model: scopedModel, explicitThinkingLevel: false }],
+			SessionManager.inMemory(),
+			modelRegistry,
+			Settings.isolated({ enabledModels: ["openai/gpt-4o-mini"] }),
+		);
+
+		// The unresolved persona model leaves options.model unset so the SDK
+		// persona deferral block (sdk.ts:1408) can retry the patterns after
+		// extensions register.
+		expect(options.model).toBeUndefined();
+		expect(options.agentPersona?.model).toEqual(["runtime-provider/runtime-model"]);
+
+		const { session } = await createAgentSession({
+			...options,
+			authStorage,
+			modelRegistry,
+			sessionManager: options.sessionManager,
+			disableExtensionDiscovery: true,
+			extensions: [providerExtension],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+		});
+
+		try {
+			expect(session.model?.provider).toBe("runtime-provider");
+			expect(session.model?.id).toBe("runtime-model");
+		} finally {
+			await session.dispose();
+		}
 	});
 
 	test("uses auth fallback when deferred subagent modelPattern resolves without working credentials", async () => {

@@ -17,6 +17,7 @@ import { parseRuleConditionAndScope, type Rule, type RuleFrontmatter } from "../
 import type { Skill, SkillFrontmatter } from "../capability/skill";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import type { MCPRequestIdFormat } from "../mcp/types";
+import type { AgentAvailability } from "../task/types";
 import { type ConfiguredThinkingLevel, parseConfiguredThinkingLevel } from "../thinking";
 import { normalizeToolNames } from "../tools/builtin-names";
 
@@ -245,6 +246,7 @@ export interface ParsedAgentFields {
 	blocking?: boolean;
 	/** `true` = prewalk into the default target; string = prewalk into that model pattern. */
 	prewalk?: boolean | string;
+	availability?: AgentAvailability;
 }
 
 /**
@@ -262,8 +264,22 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 	let tools = parseArrayOrCSV(frontmatter.tools);
 	if (tools) tools = normalizeToolNames(tools);
 
+	// Availability: OpenCode `mode` (canonical) + Copilot aliases
+	const mode = typeof frontmatter.mode === "string" ? frontmatter.mode.trim().toLowerCase() : undefined;
+	const userInvocable = parseBoolean(frontmatter["user-invocable"]);
+	const disableModelInvocation = parseBoolean(frontmatter["disable-model-invocation"]);
+	let availability: AgentAvailability = "all";
+	if (mode === "primary") availability = "primary";
+	else if (mode === "subagent") availability = "subagent";
+	else if (mode === "all") availability = "all";
+	if (mode === undefined) {
+		const ui = userInvocable ?? true;
+		const dmi = disableModelInvocation ?? false;
+		availability = !ui ? "subagent" : dmi ? "primary" : "all";
+	}
+
 	// Subagents with explicit tool lists always need yield
-	if (tools && !tools.includes("yield")) {
+	if (tools && !tools.includes("yield") && availability !== "primary") {
 		tools = [...tools, "yield"];
 	}
 
@@ -277,9 +293,13 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 			spawns = "*";
 		} else {
 			spawns = parseArrayOrCSV(trimmed);
+			// Explicit empty string → disable spawning
+			if (spawns === undefined && trimmed === "") spawns = [];
 		}
 	} else {
 		spawns = parseArrayOrCSV(frontmatter.spawns);
+		// Explicit empty array → disable spawning
+		if (spawns === undefined && Array.isArray(frontmatter.spawns)) spawns = [];
 	}
 
 	// Backward compat: infer spawns: "*" when tools includes "task"
@@ -308,6 +328,7 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 	const autoloadSkills = parseArrayOrCSV(frontmatter.autoloadSkills)
 		?.map(s => s.trim())
 		.filter(Boolean);
+
 	return {
 		name,
 		description,
@@ -320,6 +341,7 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 		autoloadSkills,
 		readSummarize,
 		prewalk,
+		availability,
 	};
 }
 

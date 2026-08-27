@@ -121,6 +121,41 @@ Loaded via symbolic link.
 		expect(session.skills.some((s: Skill) => s.name === "test-skill")).toBe(true);
 	});
 
+	it("expands tilde spellings in explicit extension roots", async () => {
+		// Codex 3741885997: additionalExtensionPaths: ["~/pack"] must expand the
+		// same way the extension loader does (expandTilde -> os.homedir), not
+		// path.resolve(cwd, raw) which would produce "/repo/~/pack" and make
+		// task-time rediscovery look in the wrong directory.
+		const previousAgentDir = getAgentDir();
+		setAgentDir(path.join(tempHomeDir, ".omp", "agent"));
+		let session: AgentSession | undefined;
+		try {
+			({ session } = await createAgentSession({
+				cwd: tempDir,
+				agentDir: path.join(tempHomeDir, ".omp", "agent"),
+				modelRegistry: sharedModelRegistry,
+				additionalExtensionPaths: ["~/tilde-extension"],
+				enableMCP: false,
+				enableLsp: false,
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				rules: [],
+				sessionManager: SessionManager.inMemory(),
+				settings: createIsolatedSkillsSettings(),
+				disableExtensionDiscovery: true,
+			}));
+
+			// The persisted extensionRoots must carry the EXPANDED path (home-
+			// based, like the loader), never the cwd-joined literal.
+			expect(session.extensionRoots).toEqual([path.join(os.homedir(), "tilde-extension")]);
+			expect(session.extensionRoots?.[0]).not.toContain("~/");
+		} finally {
+			await session?.dispose();
+			setAgentDir(previousAgentDir);
+		}
+	});
+
 	it("SDK invocation root scope isolates disabled discovery and merges normal discovery", async () => {
 		const explicitPackage = path.join(tempDir, "sdk-explicit-extension");
 		const settingsPackage = path.join(tempDir, "sdk-settings-extension");

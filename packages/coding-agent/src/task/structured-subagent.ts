@@ -251,7 +251,11 @@ export async function resolveEffectiveSubagentPolicy(
 	assertPlanControlsAllowed(request, planMode);
 	assertDepthAndSpawnAllowed(request, agentName);
 
-	const discovery = await discoverAgents(request.session.cwd);
+	const discovery = await discoverAgents(request.session.cwd, undefined, {
+		includeExtensions: true,
+		extensionMode: request.session.getExtensionDiscoveryMode?.(),
+		extensionRoots: request.session.extensionRoots,
+	});
 	const agent = getAgent(discovery.agents, agentName);
 	if (!agent) {
 		const available = discovery.agents.map(candidate => candidate.name).join(", ") || "none";
@@ -265,6 +269,12 @@ export async function resolveEffectiveSubagentPolicy(
 		throw new StructuredSubagentError(
 			"preflight",
 			`Agent "${agentName}" is disabled in settings. Enable it via /agents, or use a different agent type.${enabled.length > 0 ? ` Available: ${enabled.join(", ")}` : ""}`,
+		);
+	}
+	if (agent.availability === "primary") {
+		throw new StructuredSubagentError(
+			"preflight",
+			`Agent "${agentName}" is primary-only and cannot be spawned as a subagent.`,
 		);
 	}
 
@@ -421,6 +431,7 @@ function buildExecutorOptions(
 		enableIrc: policy.enableIrc,
 		maxRuntimeMs: request.maxRuntimeMs,
 		restrictToolNames,
+		disableExtensionDiscovery: session.getExtensionDiscoveryMode?.() === "explicit-only",
 		keepAlive: request.keepAlive,
 		signal: request.signal,
 		eventBus: session.eventBus,
@@ -437,6 +448,7 @@ function buildExecutorOptions(
 		promptTemplates: session.promptTemplates,
 		rules: session.rules,
 		preloadedExtensionPaths: restrictToolNames ? [] : session.extensionPaths,
+		preloadedExtensionRoots: restrictToolNames ? [] : session.extensionRoots,
 		preloadedCustomToolPaths: restrictToolNames ? [] : session.customToolPaths,
 		localProtocolOptions,
 		parentArtifactManager: session.getArtifactManager?.() ?? undefined,

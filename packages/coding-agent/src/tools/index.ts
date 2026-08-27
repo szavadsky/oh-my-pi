@@ -191,6 +191,15 @@ export interface ToolSession {
 	 */
 	extensionPaths?: string[];
 	/**
+	 * Resolved explicit extension-package ROOT directories (e.g. `./pack` →
+	 * `/abs/pack`), distinct from {@link extensionPaths} (entry files like
+	 * `pack/index.ts`). Agent/skill discovery surfaces (task tool, scout
+	 * availability, spawn preflight, live /agent) must resolve these package
+	 * roots so `pack/agents/*.md` keeps surfacing after the construction-time
+	 * invocation scope is gone.
+	 */
+	extensionRoots?: string[];
+	/**
 	 * Pre-discovered custom-tool source paths from `.omp/tools/`, `.claude/tools/`,
 	 * plugins, etc. Forwarded to subagents so they skip the FS scan but still
 	 * re-bind tools to their own session-scoped `CustomToolAPI`.
@@ -269,6 +278,14 @@ export interface ToolSession {
 	allocateOutputArtifact?: (toolType: string) => Promise<{ id?: string; path?: string }>;
 	/** Get session spawns */
 	getSessionSpawns: () => string | null;
+	/**
+	 * Extension-agent discovery mode for this session: "explicit-only" under
+	 * --no-extensions (only CLI-named roots), "merge" otherwise. Agent/skill
+	 * discovery surfaces (task tool, scout availability, spawn preflight) must
+	 * rediscover under this mode so a session launched with extensions disabled
+	 * never sees ambient plugin agents.
+	 */
+	getExtensionDiscoveryMode?: () => "explicit-only" | "merge";
 	/** Get resolved model string if explicitly set for this session */
 	getModelString?: () => string | undefined;
 	/** Get the current session model string, regardless of how it was chosen */

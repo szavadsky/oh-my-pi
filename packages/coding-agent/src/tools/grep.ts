@@ -22,7 +22,7 @@ import type { InternalResource, ResolveContext } from "../internal-urls/types";
 import type { Theme } from "../modes/theme/theme";
 import grepDescription from "../prompts/tools/grep.md" with { type: "text" };
 import { DEFAULT_MAX_COLUMN, type TruncationResult, truncateHead, truncateLine } from "../session/streaming-output";
-import { isScoutSpawnable } from "../task/spawn-policy";
+import { scoutAvailableForSession } from "../task/spawn-policy";
 import {
 	Ellipsis,
 	fileHyperlink,
@@ -915,10 +915,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 		return prompt.render(grepDescription, {
 			IS_HL_MODE: displayMode.hashLines,
 			IS_LINE_NUMBER_MODE: !displayMode.hashLines && displayMode.lineNumbers,
-			scoutAvailable: isScoutSpawnable(
-				this.session.settings.get("task.disabledAgents") as string[] | undefined,
-				this.session.getSessionSpawns?.() ?? "*",
-			),
+			scoutAvailable: scoutAvailableForSession(this.session),
 		});
 	}
 	readonly parameters = searchSchema;

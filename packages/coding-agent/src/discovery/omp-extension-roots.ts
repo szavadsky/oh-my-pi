@@ -183,15 +183,32 @@ async function isDirectory(p: string): Promise<boolean> {
  * Installed-plugin enumeration failures (missing lockfile, unreadable
  * `package.json`, etc.) are logged at `debug` and degrade gracefully — the
  * other sources still surface.
+ *
+ * Under `explicit-only` mode only sources from step 1 are returned: configured
+ * (`settings.json#extensions`) and installed plugin roots are suppressed, so
+ * `--no-extensions` sessions surface exactly the roots the invocation named.
+ * The mode resolves as explicit `options.mode` (what the calling discovery
+ * surface was asked for) > invocation-scoped ALS mode > global injected mode.
+ *
+ * `options.explicitRoots` (session-persisted, resolved against `ctx.cwd`)
+ * overrides both ALS and injected candidates: SDK sessions that pass explicit
+ * extension packages must keep seeing exactly those roots when discovery
+ * re-runs after the construction-time invocation scope is gone.
  */
-export async function listOmpExtensionRoots(ctx: LoadContext): Promise<OmpExtensionRoot[]> {
+export async function listOmpExtensionRoots(
+	ctx: LoadContext,
+	options?: { mode?: OmpExtensionRootMode; explicitRoots?: readonly string[] },
+): Promise<OmpExtensionRoot[]> {
 	const scopedRoots = invocationRootScope.getStore();
-	const rootMode = scopedRoots?.mode ?? injectedCliRootMode;
-	let candidates: InjectedRoot[] = scopedRoots
-		? scopedRoots.paths.map(raw => ({ path: resolveAgainst(raw, ctx), level: "user" }))
-		: injectedCliRoots.map(root =>
-				root.relativePath ? { ...root, path: path.resolve(ctx.cwd, root.relativePath) } : root,
-			);
+	const rootMode = options?.mode ?? scopedRoots?.mode ?? injectedCliRootMode;
+	let candidates: InjectedRoot[] =
+		options?.explicitRoots !== undefined
+			? options.explicitRoots.map(raw => ({ path: resolveAgainst(raw, ctx), level: "user" }))
+			: scopedRoots
+				? scopedRoots.paths.map(raw => ({ path: resolveAgainst(raw, ctx), level: "user" }))
+				: injectedCliRoots.map(root =>
+						root.relativePath ? { ...root, path: path.resolve(ctx.cwd, root.relativePath) } : root,
+					);
 	if (rootMode === "merge") {
 		const { project, user } = scopeDirs(ctx);
 		const [projectExtensions, userExtensions, installedPlugins] = await Promise.all([

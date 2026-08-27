@@ -33,6 +33,7 @@ import type { ContextUsage } from "../extensibility/extensions/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { SecretObfuscator } from "../secrets/obfuscator";
+import type { AgentDefinition } from "../task/types";
 import type { ConfiguredThinkingLevel } from "../thinking";
 import type { XdevState } from "../tools/xdev";
 import type { CodexAutoRedeemCoordinator } from "./codex-auto-reset";
@@ -123,8 +124,6 @@ export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
-	/** Whether the session spawn policy permits the read-only `scout` subagent. Defaults to true. */
-	scoutAllowedBySpawnPolicy?: boolean;
 	/** Whether the caller explicitly requested yolo/auto-approve behavior for this session. */
 	autoApprove?: boolean;
 	/** Models to cycle through with Ctrl+P (from --models flag). */
@@ -282,6 +281,48 @@ export interface AgentSessionConfig {
 	disconnectOwnedMcpManager?: () => Promise<void>;
 	/** System prompt used by automatic session-title generation. */
 	titleSystemPrompt?: string;
+	/** Callback to update the session-level spawns allowlist. */
+	setSessionSpawns?: (spawns: string) => void;
+	/** Callback to read the session-level spawns allowlist. */
+	getSessionSpawns?: () => string | undefined;
+	/** The session's spawns baseline (options.spawns ?? "*"), restored when a persona without spawns is cleared. */
+	baselineSpawns?: string;
+	/** Callback to update the active agent persona in the SDK closure. */
+	setAgentPersona?: (agent: AgentDefinition | undefined) => void;
+	/** Initial agent persona (from --agent CLI or resume). */
+	agentPersona?: AgentDefinition;
+	/** Restores the pre-overlay tool set when an initial persona had explicit tools. */
+	initialToolOverlayRestore?: () => Promise<void>;
+	/** Explicit CLI tool selection (`--tools`/`--no-tools`) is not a persona overlay and must survive persona switches. */
+	cliToolsLocked?: boolean;
+	/** Explicit CLI model selection (`--model`) must survive persona switches. */
+	cliModelLocked?: boolean;
+	/** Explicit CLI thinking selection (`--thinking`) must survive persona switches. */
+	cliThinkingLocked?: boolean;
+	/** True when the tool set came from an agent persona's frontmatter; baseline restore then uses the registry default instead of the persona list. */
+	toolNamesFromAgent?: boolean;
+	/**
+	 * Extension-agent discovery mode for this session: "explicit-only" under
+	 * --no-extensions (only CLI-named roots), "merge" otherwise. Live /agent
+	 * lookups and the persona picker must rediscover under the same mode so a
+	 * session launched with extensions disabled cannot switch to an extension
+	 * persona that startup suppressed.
+	 */
+	getExtensionDiscoveryMode?: () => "explicit-only" | "merge";
+	/**
+	 * Resolved explicit extension-package root paths for this session (from
+	 * `additionalExtensionPaths` / `preloadedExtensionPaths`). Persisted so
+	 * task-time rediscovery and the persona picker keep resolving the agents
+	 * these roots ship after the construction-time invocation scope is gone.
+	 */
+	extensionPaths?: string[];
+	/**
+	 * Explicit extension-package ROOT directories (resolved), distinct from
+	 * {@link extensionPaths} (entry files). Agent/skill discovery (task tool,
+	 * scout availability, live /agent, picker) needs these directories so
+	 * `pack/agents/*.md` keeps surfacing at task time.
+	 */
+	extensionRoots?: string[];
 }
 
 /** Options for AgentSession.prompt(). */

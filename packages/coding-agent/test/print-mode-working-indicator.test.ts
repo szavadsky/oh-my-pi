@@ -85,6 +85,10 @@ function createDelayedSession(
 		setActiveToolsByName: async (names: string[]) => {
 			enabledToolNames = names;
 		},
+		applyToolOverlay: async (names: string[]) => {
+			enabledToolNames = names;
+			return { restore: async () => {} };
+		},
 		getPlanModeState: () => planModeState,
 		setPlanModeState: (state: PlanModeState | undefined) => {
 			planModeState = state;

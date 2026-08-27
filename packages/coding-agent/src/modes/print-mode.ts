@@ -142,7 +142,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		const planFilePath = session.getPlanReferencePath() || "local://PLAN.md";
 		const previousTools = session.getEnabledToolNames();
 		const planTools = session.hasBuiltInTool("write") ? [...new Set([...previousTools, "write"])] : previousTools;
-		await session.setActiveToolsByName(planTools);
+		await session.applyToolOverlay(planTools);
 		session.setPlanModeState({
 			enabled: true,
 			planFilePath,

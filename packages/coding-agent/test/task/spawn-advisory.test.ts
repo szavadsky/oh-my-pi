@@ -95,7 +95,18 @@ describe("task tool advisory gating via suppressSpawnAdvisory", () => {
 	}
 
 	async function spawnTextFor(s: ToolSession): Promise<string> {
-		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [
+				agent,
+				{
+					name: "scout",
+					description: "Read-only scout agent",
+					systemPrompt: "You are a scout.",
+					source: "bundled",
+				},
+			],
+			projectAgentsDir: null,
+		});
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(
 			async (options): Promise<SingleResult> => ({
 				index: options.index ?? 0,

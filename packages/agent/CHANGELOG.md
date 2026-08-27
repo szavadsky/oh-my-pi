@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Added the explicit `agent_change` case to the compaction metadata-entry switches (`getMessageFromEntry` and `findValidCutPoints`): the persona-change entry is now formally excluded from conversation content and cut-point logic instead of relying on implicit fall-through.
+
 ## [17.2.10] - 2026-08-06
 
 ### Fixed

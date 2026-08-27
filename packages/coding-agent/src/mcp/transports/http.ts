@@ -279,7 +279,7 @@ export class HttpTransport implements MCPTransport {
 
 			return result.result as T;
 		} catch (error) {
-			if (operation.isTimeoutAbort(error)) {
+			if (operation.isTimeoutAbort(error) || operation.timedOut()) {
 				throw new Error(`Request timeout after ${timeout}ms`);
 			}
 			throw error;

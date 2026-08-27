@@ -1,5 +1,6 @@
 import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
 import { COLLAB_GUEST_ALLOWED_COMMANDS } from "../collab/guest";
+import { discoverAgents, getAgent } from "../task/discovery";
 import { BUILTIN_COLLABORATION_SLASH_COMMANDS } from "./builtin-collaboration";
 import {
 	buildArgumentCompletions,
@@ -13,7 +14,7 @@ import { BUILTIN_LIFECYCLE_SLASH_COMMANDS } from "./builtin-lifecycle";
 import { BUILTIN_MARKETPLACE_SLASH_COMMANDS, reloadTuiPluginState } from "./builtin-marketplace";
 import { BUILTIN_MODE_SLASH_COMMANDS } from "./builtin-modes";
 import { BUILTIN_SESSION_SLASH_COMMANDS } from "./builtin-session";
-import { parseSlashCommand } from "./helpers/parse";
+import { commandConsumed, parseSlashCommand } from "./helpers/parse";
 import type {
 	BuiltinSlashCommand,
 	ParsedSlashCommand,
@@ -41,6 +42,132 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	...BUILTIN_LIFECYCLE_SLASH_COMMANDS,
 	...BUILTIN_MARKETPLACE_SLASH_COMMANDS,
 	...BUILTIN_CONTROL_SLASH_COMMANDS,
+	{
+		name: "agent",
+		aliases: ["switch-agent"],
+		description:
+			"Switch to a different agent persona. Use /agent <name> to switch directly, or /agent to open the picker.",
+		allowArgs: true,
+		inlineHint: "[name]",
+		handle: async (command, runtime) => {
+			if (runtime.session.isStreaming) {
+				await runtime.output("Cannot switch agent while streaming.");
+				return commandConsumed();
+			}
+			if (runtime.session.getPlanModeState()?.enabled) {
+				await runtime.output("Cannot switch agent during plan mode. Exit plan mode first.");
+				return commandConsumed();
+			}
+			if (runtime.session.getGoalModeState()?.enabled) {
+				await runtime.output("Cannot switch agent during goal mode. Exit goal mode first.");
+				return commandConsumed();
+			}
+			if (runtime.session.getVibeModeState()?.enabled) {
+				await runtime.output("Cannot switch agent during vibe mode. Exit vibe mode first.");
+				return commandConsumed();
+			}
+			const agentName = command.args.trim();
+			if (!agentName) {
+				await runtime.output("Usage: /agent <name>");
+				return commandConsumed();
+			}
+
+			// Rediscover under the session's extension mode so a --no-extensions
+			// session cannot switch to an extension/plugin persona startup suppressed.
+			const discovery = await discoverAgents(runtime.cwd, undefined, {
+				includeExtensions: true,
+				extensionMode: runtime.session.getExtensionDiscoveryMode(),
+				extensionRoots: runtime.session.extensionRoots,
+			});
+			const disabled = new Set((runtime.settings.get("task.disabledAgents") as string[] | undefined) ?? []);
+			const agent = getAgent(discovery.agents, agentName);
+			if (agent && disabled.has(agent.name)) {
+				await runtime.output(`Agent "${agentName}" is disabled in settings (task.disabledAgents).`);
+				return commandConsumed();
+			}
+			if (!agent) {
+				const available =
+					discovery.agents
+						.filter(a => a.availability !== "subagent")
+						.map(a => a.name)
+						.join(", ") || "none";
+				await runtime.output(`Unknown agent "${agentName}". Available: ${available}`);
+				return commandConsumed();
+			}
+			if (agent.availability === "subagent") {
+				await runtime.output(`Agent "${agentName}" is subagent-only and cannot be selected as main persona.`);
+				return commandConsumed();
+			}
+
+			try {
+				await runtime.session.switchAgentPersona(agent);
+			} catch (error) {
+				await runtime.output(`Failed to switch agent: ${error}`);
+				return commandConsumed();
+			}
+			await runtime.output(`Switched to agent persona "${agent.name}".`);
+			return commandConsumed();
+		},
+		handleTui: async (command, runtime) => {
+			if (runtime.ctx.session.isStreaming) {
+				runtime.ctx.showWarning("Cannot switch agent while streaming.");
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (runtime.ctx.planModeEnabled) {
+				runtime.ctx.showWarning("Cannot switch agent during plan mode. Exit plan mode first.");
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (runtime.ctx.goalModeEnabled) {
+				runtime.ctx.showWarning("Cannot switch agent during goal mode. Exit goal mode first.");
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (runtime.ctx.vibeModeEnabled) {
+				runtime.ctx.showWarning("Cannot switch agent during vibe mode. Exit vibe mode first.");
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			const agentName = command.args.trim();
+			if (agentName) {
+				const discovery = await discoverAgents(runtime.ctx.sessionManager.getCwd(), undefined, {
+					includeExtensions: true,
+					extensionMode: runtime.ctx.session.getExtensionDiscoveryMode(),
+					extensionRoots: runtime.ctx.session.extensionRoots,
+				});
+				const disabled = new Set((runtime.ctx.settings.get("task.disabledAgents") as string[] | undefined) ?? []);
+				const agent = getAgent(discovery.agents, agentName);
+				if (agent && disabled.has(agent.name)) {
+					runtime.ctx.showWarning(`Agent "${agentName}" is disabled in settings (task.disabledAgents).`);
+					runtime.ctx.editor.setText("");
+					return;
+				}
+				if (!agent) {
+					runtime.ctx.showWarning(`Unknown agent "${agentName}".`);
+					runtime.ctx.editor.setText("");
+					return;
+				}
+				if (agent.availability === "subagent") {
+					runtime.ctx.showWarning(`Agent "${agentName}" is subagent-only.`);
+					runtime.ctx.editor.setText("");
+					return;
+				}
+				try {
+					await runtime.ctx.session.switchAgentPersona(agent);
+				} catch (error) {
+					runtime.ctx.showWarning(`Failed to switch agent: ${error}`);
+					runtime.ctx.editor.setText("");
+					return;
+				}
+				runtime.ctx.editor.setText("");
+				return;
+			}
+
+			runtime.ctx.showAgentPersonaSelector();
+			runtime.ctx.editor.setText("");
+		},
+	},
 ];
 
 const BUILTIN_SLASH_COMMAND_LOOKUP = new Map<string, SlashCommandSpec>();

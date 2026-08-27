@@ -160,6 +160,42 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(forwarded?.preloadedCustomToolPaths).toBeUndefined();
 	});
 
+	it("does not auto-add the task tool when spawns is an empty list", async () => {
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "spawns-empty-child",
+			agent: { ...baseAgent, tools: ["read"], spawns: [] },
+		});
+
+		expect(result.exitCode).toBe(0);
+		const forwarded = spy.mock.calls[0]?.[0];
+		// `spawns: []` explicitly disables spawning — advertising a task tool whose
+		// every invocation errors "spawning disabled" is a trap. The task tool must
+		// not be auto-added; the always-on hub tool still is.
+		expect(forwarded?.toolNames).toEqual(["read", "hub"]);
+		expect(forwarded?.toolNames).not.toContain("task");
+		// And the session's spawn policy reflects the explicit disable.
+		expect(forwarded?.spawns).toBe("");
+	});
+
+	it("auto-adds the task tool when spawns is non-empty", async () => {
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "spawns-nonempty-child",
+			agent: { ...baseAgent, tools: ["read"], spawns: ["scout"] },
+		});
+
+		expect(result.exitCode).toBe(0);
+		const forwarded = spy.mock.calls[0]?.[0];
+		expect(forwarded?.toolNames).toEqual(["read", "task", "hub"]);
+	});
+
 	it("records the spawning agent as parentAgentId, distinct from the child's own id and prefix", async () => {
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));

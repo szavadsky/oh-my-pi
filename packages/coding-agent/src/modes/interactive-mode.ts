@@ -565,8 +565,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	#signalTeardown?: SessionTeardown;
 	readonly #version: string;
 	readonly #startupChangelog: StartupChangelogSelection | undefined;
+	#planModeToolOverlay: { restore: () => Promise<void> } | undefined;
 	#planModePreviousTools: string[] | undefined;
+	/** Whether a persona was active when plan mode was entered. */
+	#planModePreviousPersona = false;
 	#goalModePreviousTools: string[] | undefined;
+	#goalModeToolOverlay: { restore: () => Promise<void> } | undefined;
+	/** Whether a persona was active when goal mode was entered. */
+	#goalModePreviousPersona = false;
 	#vibeModePreviousTools: string[] | undefined;
 	#vibeModeOwnerScope: VibeOwnerScope | undefined;
 	#vibeScopeSuspendedForSwitch = false;
@@ -2438,10 +2444,38 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.planModeEnabled || this.planModePaused) {
 			this.session.setPlanModeState(undefined);
 			try {
-				if (this.#planModePreviousTools !== undefined) {
-					await this.session.setActiveToolsByName(this.#planModePreviousTools);
-				}
+				// This runs only from #reconcileModeFromSession, i.e. after
+				// switchSession already loaded and rehydrated the target
+				// session's persona tools. The #planModeToolOverlay handle
+				// belongs to the SOURCE session — restoring it would clobber
+				// the target's active set (e.g. a read-only persona suddenly
+				// running the source's full baseline) until another restart or
+				// persona switch. Drop the handle without re-applying it
+				// (mirrors the vibe branch below); a same-session /plan exit
+				// still restores through #exitPlanMode's own path.
+				this.#planModeToolOverlay = undefined;
 			} finally {
+				// A switch to a target with NO recorded persona (switchSession's
+				// persona else-branch cleared persona state AND restored the
+				// launch baseline) would otherwise be re-clobbered by the
+				// pre-plan snapshot — but only when a persona was actually
+				// active at plan entry: the snapshot is then the source
+				// persona's restricted set, which must not leak onto the
+				// persona-less target. A persona-less source captured the
+				// launch baseline itself, and switchSession has no persona
+				// overlay to restore for it, so re-applying the pre-plan set
+				// there is the correct baseline (codex 3742806339).
+				if (
+					!this.session.agentPersona &&
+					!this.#planModePreviousPersona &&
+					this.#planModePreviousTools !== undefined
+				) {
+					try {
+						await this.session.setActiveToolsByName(this.#planModePreviousTools);
+					} catch (error) {
+						logger.warn("Failed to restore pre-plan baseline on session switch", { error: String(error) });
+					}
+				}
 				this.session.setPlanProposalHandler?.(null);
 				this.planModeEnabled = false;
 				this.planModePaused = false;
@@ -2456,10 +2490,33 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		if (this.goalModeEnabled || this.goalModePaused) {
-			if (this.#goalModePreviousTools !== undefined) {
-				await this.session.setActiveToolsByName(this.#goalModePreviousTools);
-			}
+			// This runs only from #reconcileModeFromSession, i.e. after
+			// switchSession already loaded and rehydrated the target session's
+			// persona tools. The #goalModePreviousTools snapshot belongs to the
+			// SOURCE session — re-applying it onto a persona target would clobber
+			// the target's active set (mirrors the plan/vibe branches above).
+			// A persona-less target keeps the launch baseline switchSession's
+			// persona else-branch restored — re-applying a persona-sourced
+			// pre-goal snapshot would leak the source persona's tools onto it;
+			// only a persona-less SOURCE captured the launch baseline itself and
+			// needs the restore (codex 3742806339). A same-session /goal exit
+			// still restores through #exitGoalMode's own path.
 			this.session.setGoalModeState(undefined);
+			// The #goalModeToolOverlay handle belongs to the SOURCE session —
+			// restoring it would clobber the target's active set (mirrors the
+			// plan branch).
+			this.#goalModeToolOverlay = undefined;
+			if (
+				!this.session.agentPersona &&
+				!this.#goalModePreviousPersona &&
+				this.#goalModePreviousTools !== undefined
+			) {
+				try {
+					await this.session.setActiveToolsByName(this.#goalModePreviousTools);
+				} catch (error) {
+					logger.warn("Failed to restore pre-goal baseline on session switch", { error: String(error) });
+				}
+			}
 			this.goalModeEnabled = false;
 			this.goalModePaused = false;
 			this.#goalModePreviousTools = undefined;
@@ -2531,6 +2588,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (restored?.goal) {
 				const previousTools = this.session.getEnabledToolNames().filter(name => name !== "goal");
 				this.#goalModePreviousTools = previousTools;
+				this.#goalModePreviousPersona = this.session.agentPersona !== undefined;
 				await this.session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
 			}
 			this.#updateGoalModeStatus();
@@ -2597,13 +2655,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		const uniquePlanTools = [...new Set([...previousTools, ...planAugmentations])];
 
 		this.#planModePreviousTools = previousTools;
+		this.#planModePreviousPersona = this.session.agentPersona !== undefined;
 		this.planModePlanFilePath = planFilePath;
 		this.planModeEnabled = true;
 		// Suppress cache-miss marker on the next turn: plan mode changes the system
 		// prompt, which predictably invalidates the cache.
 		this.lastAssistantUsage = undefined;
 
-		await this.session.setActiveToolsByName(uniquePlanTools);
+		this.#planModeToolOverlay = await this.session.applyToolOverlay(uniquePlanTools);
 		this.session.setPlanModeState({
 			enabled: true,
 			planFilePath,
@@ -2673,9 +2732,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			: undefined;
 		this.session.setPlanModeState(undefined);
 		try {
-			if (this.#planModePreviousTools !== undefined) {
-				await this.session.setActiveToolsByName(this.#planModePreviousTools);
-			}
+			await this.#planModeToolOverlay?.restore();
+			this.#planModeToolOverlay = undefined;
 			if (this.#planModePreviousModelState && !options?.deferModelRestore) {
 				await this.#restorePlanPreviousModel(this.#planModePreviousModelState);
 			}
@@ -2748,11 +2806,16 @@ export class InteractiveMode implements InteractiveModeContext {
 		const previousTools = this.session.getEnabledToolNames().filter(name => name !== "goal");
 		const goalTools = [...new Set([...previousTools, "goal"])];
 		this.#goalModePreviousTools = previousTools;
+		this.#goalModePreviousPersona = this.session.agentPersona !== undefined;
 		this.goalModePaused = false;
 		const state = options.resume
 			? await this.session.goalRuntime.resumeGoal()
 			: await this.session.goalRuntime.createGoal({ objective: options.objective ?? "" });
-		await this.session.setActiveToolsByName(goalTools);
+		// applyToolOverlay snapshots the top-level vs xd:// mounted partition so
+		// exit restores the exact presentation; setActiveToolsByName would
+		// reclassify mounts against the current xdev state (mirrors the plan-mode
+		// fix for codex 3742806339).
+		this.#goalModeToolOverlay = await this.session.applyToolOverlay(goalTools);
 		this.session.setGoalModeState(state);
 		this.goalModeEnabled = true;
 		this.#resetGoalContinuationSuppression();
@@ -2771,8 +2834,19 @@ export class InteractiveMode implements InteractiveModeContext {
 		reason?: "completed" | "paused" | "dropped";
 	}): Promise<void> {
 		const previousTools = this.#goalModePreviousTools;
-		if (this.goalModeEnabled && previousTools) {
-			await this.session.setActiveToolsByName(previousTools);
+		if (this.goalModeEnabled) {
+			// Restore through the overlay handle captured at entry so the exact
+			// top-level vs xd:// mounted partition returns (setActiveToolsByName
+			// reclassifies mounts against the current xdev state, which may have
+			// drifted since entry — e.g. a deferred MCP connect changed mount
+			// availability). Mirrors the plan-mode fix.
+			await this.#goalModeToolOverlay?.restore();
+			this.#goalModeToolOverlay = undefined;
+		}
+		if (previousTools === undefined) {
+			// Defensive: no entry snapshot (e.g. goal state restored from a
+			// transcript without a live entry path); fall back to the raw set.
+			await this.session.setActiveToolsByName(this.session.getEnabledToolNames().filter(name => name !== "goal"));
 		}
 		const currentState = this.session.getGoalModeState();
 		if (options?.reason === "completed") {
@@ -4726,6 +4800,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	showAgentsDashboard(): void {
 		void this.#selectorController.showAgentsDashboard();
+	}
+
+	showAgentPersonaSelector(): void {
+		void this.#selectorController.showAgentPersonaSelector();
 	}
 
 	showModelSelector(options?: { temporaryOnly?: boolean }): void {

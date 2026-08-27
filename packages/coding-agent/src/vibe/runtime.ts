@@ -1437,6 +1437,7 @@ export class VibeSessionRegistry {
 			promptTemplates: session.promptTemplates,
 			rules: session.rules,
 			preloadedExtensionPaths: session.extensionPaths,
+			preloadedExtensionRoots: session.extensionRoots,
 			preloadedCustomToolPaths: session.customToolPaths,
 			localProtocolOptions,
 			parentArtifactManager: session.getArtifactManager?.() ?? undefined,
@@ -1447,6 +1448,7 @@ export class VibeSessionRegistry {
 			parentAgentId: session.getAgentId?.() ?? MAIN_AGENT_ID,
 			parentServiceTier: session.getServiceTierByFamily ? (session.getServiceTierByFamily() ?? null) : undefined,
 			keepAlive: true,
+			disableExtensionDiscovery: session.getExtensionDiscoveryMode?.() === "explicit-only",
 		};
 	}
 

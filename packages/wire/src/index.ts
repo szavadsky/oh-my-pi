@@ -158,13 +158,24 @@ export interface ThinkingLevelChangeEntry extends EntryBase {
 	thinkingLevel?: string | null;
 }
 
+export interface AgentChangeEntry extends EntryBase {
+	type: "agent_change";
+	/** Agent name (from AgentDefinition.name). */
+	agent: string;
+	/** Agent source for disambiguation (mirrors task/types.ts AgentSource). */
+	source: "bundled" | "user" | "project";
+	/** Content fingerprint of the persona definition at save time; undefined on legacy transcripts. */
+	fingerprint?: string;
+}
+
 export type SessionEntry =
 	| MessageEntry
 	| CustomMessageEntry
 	| CompactionEntry
 	| BranchSummaryEntry
 	| ModelChangeEntry
-	| ThinkingLevelChangeEntry;
+	| ThinkingLevelChangeEntry
+	| AgentChangeEntry;
 
 /** customType of collab guest prompts injected on the host. */
 export const COLLAB_PROMPT_MESSAGE_TYPE = "collab-prompt";

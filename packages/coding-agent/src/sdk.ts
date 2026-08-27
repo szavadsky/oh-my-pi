@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import {
 	Agent,
 	type AgentEvent,
@@ -57,6 +58,7 @@ import {
 	resolveAllowedModels,
 	resolveCliModel,
 	resolveConfiguredModelPatterns,
+	resolveModelOverride,
 	resolveModelRoleValue,
 } from "./config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
@@ -163,10 +165,13 @@ import {
 	loadProjectContextFiles as loadContextFilesInternal,
 	projectSystemPromptToolMetadata,
 } from "./system-prompt";
+import { fingerprintAgentContent, resolveAgentSessionPolicy } from "./task/agent-policy";
+import { getDiscoveredAgentsSnapshot } from "./task/discovery-snapshot";
+import { discoverAgentsForCreate } from "./task/index";
 import { AgentOutputManager } from "./task/output-manager";
 import { wrapStreamFnWithProviderConcurrency } from "./task/provider-concurrency";
-import { isScoutSpawnable } from "./task/spawn-policy";
-import type { StructuredSubagentSchemaMode } from "./task/types";
+import { isSpawnableScoutInAgents } from "./task/spawn-policy";
+import type { AgentDefinition, StructuredSubagentSchemaMode } from "./task/types";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -211,6 +216,7 @@ import { ToolContextStore } from "./tools/context";
 import { isIrcEnabled } from "./tools/hub";
 import { getImageGenTools } from "./tools/image-gen";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
+import { expandTilde } from "./tools/path-utils";
 import { isAutoQaEnabled } from "./tools/report-tool-issue";
 import { queueResolveHandler } from "./tools/resolve";
 import { USER_TODO_EDIT_CUSTOM_TYPE } from "./tools/todo";
@@ -349,6 +355,17 @@ export interface CreateAgentSessionOptions {
 	/** Spawns to allow. Default: "*" */
 	spawns?: string;
 
+	/** Agent persona to apply as main-session policy (from --agent or /agent). */
+	agentPersona?: AgentDefinition;
+	/** Explicit CLI tool selection (`--tools`/`--no-tools`) is not a persona overlay and must survive persona switches. */
+	cliToolsLocked?: boolean;
+	/** Explicit CLI model selection (`--model`) must survive persona switches. */
+	cliModelLocked?: boolean;
+	/** Explicit CLI thinking selection (`--thinking`) must survive persona switches. */
+	cliThinkingLocked?: boolean;
+	/** True when the tool set came from an agent persona's frontmatter; baseline restore then uses the registry default instead of the persona list. */
+	toolNamesFromAgent?: boolean;
+
 	/** Auth storage for credentials. Default: discoverAuthStorage(agentDir) */
 	authStorage?: AuthStorage;
 	/** Model registry. Default: discoverModels(authStorage, agentDir) */
@@ -442,6 +459,13 @@ export interface CreateAgentSessionOptions {
 	 * This is the safe pass-through for parent → subagent forwarding.
 	 */
 	preloadedExtensionPaths?: string[];
+	/**
+	 * Parent's explicit extension-package ROOT directories (resolved), distinct
+	 * from {@link preloadedExtensionPaths} (entry files). Forwarded so the
+	 * subagent's agent/skill discovery keeps resolving `pack/agents/*.md`
+	 * after the parent's invocation scope is gone.
+	 */
+	preloadedExtensionRoots?: string[];
 	/**
 	 * Pre-discovered custom-tool source paths from `.omp/tools/`, `.claude/tools/`,
 	 * plugins, etc. When provided, the filesystem-scan inside
@@ -1226,12 +1250,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 }
 
 async function createAgentSessionScoped(options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> {
+	const rootMode = options.disableExtensionDiscovery ? "explicit-only" : "merge";
 	const cwd = options.cwd ?? getProjectDir();
 	const agentDir = options.agentDir ?? getAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
 
 	registerSshCleanup();
 	registerEvalCleanup();
+
+	// Subagent-only personas cannot be main-session personas; reject before any
+	// authStorage/modelRegistry construction so nothing needs cleanup on throw.
+	if (options.agentPersona?.availability === "subagent") {
+		throw new Error(`Agent "${options.agentPersona.name}" is subagent-only and cannot be selected as main persona.`);
+	}
 
 	// Pin authStorage to modelRegistry.authStorage: ModelRegistry.getApiKey() routes refresh
 	// failures through that instance, so any divergent storage handed to the bridge / mcpManager
@@ -1266,6 +1297,20 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		options.settingsManager ??
 		logger.time("settings", Settings.init, { cwd, agentDir }));
 	logger.time("initializeWithSettings", initializeWithSettings, settings);
+	// Personas disabled in settings must be rejected at construction too, not
+	// only at CLI startup (main.ts) and live switchAgentPersona: a directly
+	// supplied options.agentPersona (SDK embedder, the ACP factory's per-cwd
+	// re-resolve) would otherwise start the session with the disabled persona,
+	// bypassing the checks the CLI and /agent enforce (codex 3742974505).
+	if (options.agentPersona?.name) {
+		const disabledAgents = settings.get("task.disabledAgents") as string[] | undefined;
+		if (disabledAgents?.includes(options.agentPersona.name)) {
+			// Outside the construction try/catch: release an internally-created
+			// authStorage so the throw does not leak it.
+			if (ownsAuthStorage) await authStorage.close();
+			throw new Error(`Agent "${options.agentPersona.name}" is disabled in settings (task.disabledAgents).`);
+		}
+	}
 	if (!options.modelRegistry) {
 		modelRegistry.refreshInBackground();
 	}
@@ -1340,6 +1385,87 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		await sessionManager.setAdditionalDirectories(merged);
 	}
 	const providerSessionId = options.providerSessionId ?? sessionManager.getSessionId();
+	// A changed persona changes the system prompt the cache prefix is built
+	// from. Compare against the transcript's recorded persona so a plain resume
+	// (rehydrating the same persona) keeps cache continuity while an explicit or
+	// differently-resolved persona invalidates the inherited key. When name and
+	// source still match, fall back to the definition content fingerprint: the
+	// persona file may have changed since the transcript was saved, and the
+	// cache prefix would be built for the old system prompt/tool set.
+	const persistedPersona = sessionManager.buildSessionContext().agentPersona;
+	const personaFingerprint = options.agentPersona ? fingerprintAgentContent(options.agentPersona) : undefined;
+	// A persona rehydrated from the transcript (same name+source AND same
+	// content fingerprint) must not reapply its model/thinking — the
+	// transcript records the authoritative values, mirroring the CLI's
+	// agentRehydratedFromContext gate. Tools still re-resolve from the current
+	// definition (documented resume behavior). When the definition CONTENT
+	// changed since the transcript was saved (model:/thinkingLevel: edited),
+	// the caller's explicit persona is a fresh selection: apply the new
+	// defaults and record them so the next resume rehydrates the new values.
+	// A missing persisted fingerprint (legacy write paths) is unknown content,
+	// so treat it as changed and apply (codex 3741691583).
+	const personaIdentityRehydrated =
+		options.agentPersona !== undefined &&
+		persistedPersona?.agent === options.agentPersona.name &&
+		persistedPersona?.source === options.agentPersona.source &&
+		persistedPersona?.fingerprint !== undefined &&
+		persistedPersona.fingerprint === personaFingerprint;
+	// Content fingerprint additionally drives cache invalidation: the persona
+	// file may have changed since the transcript was saved, and the cache
+	// prefix would be built for the old system prompt/tool set. A missing
+	// persisted fingerprint (legacy entries, older write paths) is unknown,
+	// so treat it as changed rather than trusting the inherited cache key.
+	const personaChanged =
+		// The transcript recorded a persona that this run cannot rehydrate
+		// (definition deleted, disabled, or switched to subagent-only): the
+		// system prompt and tool set are rebuilt without it, so an inherited
+		// cache key built for the recorded persona's prompt must not survive.
+		(persistedPersona !== undefined && options.agentPersona === undefined) ||
+		(options.agentPersona !== undefined &&
+			(!personaIdentityRehydrated ||
+				persistedPersona?.fingerprint === undefined ||
+				persistedPersona.fingerprint !== personaFingerprint));
+	// Apply the persona policy for SDK/embedding callers that pass agentPersona
+	// directly (the CLI path pre-resolves these in buildSessionOptions).
+	const personaPolicy = options.agentPersona ? resolveAgentSessionPolicy(options.agentPersona) : undefined;
+	if (personaPolicy) {
+		if (options.toolNames === undefined && personaPolicy.toolNames) {
+			options.toolNames = personaPolicy.toolNames;
+			options.toolNamesFromAgent = true;
+		}
+		// A persona model that does not resolve yet (provider/model registered by
+		// an extension, e.g. `--extension ./provider-pack --agent foo`) must be
+		// deferred rather than dropped: preserve the patterns so the
+		// post-extension deferred-model block can retry them after registration.
+		let personaModelResolved: Model | undefined;
+		if (
+			options.model === undefined &&
+			options.modelPattern === undefined &&
+			!personaIdentityRehydrated &&
+			personaPolicy.modelPatterns?.length
+		) {
+			const resolved = resolveModelOverride(personaPolicy.modelPatterns, modelRegistry, settings);
+			personaModelResolved = resolved.model;
+			if (personaModelResolved) {
+				options.model = personaModelResolved;
+				if (resolved.thinkingLevel && !personaPolicy.thinkingLevel && options.thinkingLevel === undefined) {
+					options.thinkingLevel = resolved.thinkingLevel;
+				}
+			}
+		}
+		if (
+			options.model === undefined &&
+			options.modelPattern === undefined &&
+			!personaIdentityRehydrated &&
+			personaPolicy.modelPatterns?.length &&
+			!personaModelResolved
+		) {
+			options.modelPattern = personaPolicy.modelPatterns;
+		}
+		if (options.thinkingLevel === undefined && !personaIdentityRehydrated && personaPolicy.thinkingLevel) {
+			options.thinkingLevel = personaPolicy.thinkingLevel;
+		}
+	}
 	const forkCacheShapeChanged =
 		options.model !== undefined ||
 		options.modelPattern !== undefined ||
@@ -1348,13 +1474,24 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		options.customSystemPrompt !== undefined ||
 		options.appendSystemPrompt !== undefined ||
 		options.toolNames !== undefined ||
-		options.customTools !== undefined;
+		options.customTools !== undefined ||
+		personaChanged;
 	const inheritedPromptCacheKey = forkCacheShapeChanged
 		? undefined
 		: sessionManager.getHeader()?.providerPromptCacheKey;
-	const providerPromptCacheKey = options.providerPromptCacheKey ?? inheritedPromptCacheKey;
+	// The CLI resume/fork path can already have copied the header cache key
+	// into options.providerPromptCacheKey (source "fork") before the persona
+	// rehydrates here. A changed/unknown persona must not keep that stale
+	// fork-sourced key — the cache prefix was built for the old prompt/tool
+	// set. Explicit caller-pinned keys are untouched.
+	const providerPromptCacheKey =
+		options.providerPromptCacheKey !== undefined && options.providerPromptCacheKeySource !== "fork"
+			? options.providerPromptCacheKey
+			: personaChanged
+				? undefined
+				: (options.providerPromptCacheKey ?? inheritedPromptCacheKey);
 	const providerPromptCacheKeySource =
-		options.providerPromptCacheKey !== undefined
+		options.providerPromptCacheKey !== undefined && options.providerPromptCacheKeySource !== "fork"
 			? (options.providerPromptCacheKeySource ?? "explicit")
 			: providerPromptCacheKey !== undefined
 				? "fork"
@@ -1639,6 +1776,16 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (model) return formatModelString(model);
 			return undefined;
 		};
+		// Mutable holders for agent persona live-switch (Step 6/9).
+		// These are mutated by setSessionSpawns/setAgentPersona closures passed
+		// to AgentSessionConfig, and read by getSessionSpawns / rebuildSystemPrompt.
+		let sessionSpawns = options.spawns ?? "*";
+		let activeAgentPersona: AgentDefinition | undefined = options.agentPersona;
+		if (activeAgentPersona) {
+			const policy = resolveAgentSessionPolicy(activeAgentPersona);
+			if (policy.spawns !== undefined) sessionSpawns = policy.spawns;
+		}
+
 		// Per-path mutation counter shared across edit/write tools. Late-diagnostics
 		// entries capture it at fetch time and are dropped at injection if a newer
 		// mutation (any tool) bumped it in the meantime.
@@ -1708,7 +1855,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// unrelated global ref. With no lifecycle, hub cancel falls back to
 			// dispose + unregister on the session's own registry.
 			agentLifecycle: options.agentRegistry ? undefined : () => AgentLifecycleManager.global(),
-			getSessionSpawns: () => options.spawns ?? "*",
+			getSessionSpawns: () => sessionSpawns,
+			getExtensionDiscoveryMode: () => rootMode,
 			getModelString: () => (hasExplicitModel && model ? formatModelString(model) : undefined),
 			getActiveModelString,
 			getActiveModel: () => agent?.state.model ?? model,
@@ -1814,8 +1962,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			options.parentTaskPrefix ? { parentPrefix: options.parentTaskPrefix } : undefined,
 		);
 
-		// Create built-in tools (already wrapped with meta notice formatting)
-		await logger.time("createAllTools", createTools, toolSession, options.toolNames);
+		// Create built-in tools (already wrapped with meta notice formatting).
+		// Persona-sourced tool lists (toolNamesFromAgent) restrict only the
+		// initial ACTIVE set below — the registry stays full so persona-overlay
+		// restore can return to the default tool set; an explicit CLI/sdk
+		// toolNames (not from a persona) restricts the registry itself.
+		await logger.time(
+			"createAllTools",
+			createTools,
+			toolSession,
+			options.toolNamesFromAgent ? undefined : options.toolNames,
+		);
 
 		// Restricted sessions cannot inherit or discover MCP capabilities.
 		const enableMCP = !restrictToolNames && (options.enableMCP ?? true);
@@ -2010,6 +2167,16 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Forward the source-path list (NOT the loaded instances) so subagents
 		// rebuild their own session-scoped extensions.
 		toolSession.extensionPaths = extensionPaths;
+		// Explicit package ROOTS (distinct from entry files above): what
+		// additionalExtensionPaths named, resolved against cwd. Agent/skill
+		// discovery needs these directories (pack/agents/*.md), not the entry
+		// modules, and must keep resolving them after the construction-time
+		// withOmpExtensionRootScope is gone. Tilde spellings (~/pack) expand
+		// like the extension loader does, so a stored root is never the
+		// literal "/repo/~/pack" (codex 3741885997).
+		const explicitRoots = (options.additionalExtensionPaths ?? []).map(raw => path.resolve(cwd, expandTilde(raw)));
+		toolSession.extensionRoots =
+			options.preloadedExtensionRoots ?? (explicitRoots.length > 0 ? explicitRoots : undefined);
 
 		// Load inline extensions from factories
 		if (inlineExtensions.length > 0) {
@@ -2365,6 +2532,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					}
 				}
 				model = selectedModel;
+				// A persona (or explicit --model) whose pattern only resolved
+				// after extension registration must still persist its
+				// model_change: options.model stays the "explicit fresh
+				// selection" marker the resume-persistence guard keys on, and
+				// without it the next resume treats the persona as rehydrated
+				// and restores the transcript's old model instead of the
+				// persona default that this run is actually using
+				// (codex 3743133859). Only the persona path sets it — the
+				// CLI --model deferral with no persona has nothing to
+				// attribute the change to.
+				if (options.agentPersona) {
+					options.model = selectedModel;
+				}
 				initialRetryFallback =
 					retryFallback && usageFallbackTriggered ? { ...retryFallback, pinned: true } : retryFallback;
 				modelFallbackMessage = undefined;
@@ -2781,6 +2961,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const eagerTasksAlways = settings.get("task.eager") === "always";
 		const intentField = $flag("PI_INTENT_TRACING", settings.get("tools.intentTracing")) ? INTENT_FIELD : undefined;
 		const includeWorkspaceTree = settings.get("includeWorkspaceTree") ?? false;
+		// Warm the memoized discovery for the creation cwd so the first prompt
+		// build's snapshot lookup hits (the async IIFE below re-runs discovery
+		// for any later cwd). Scout availability in the system prompt must
+		// match spawn reality, not just the name-based spawn policy.
+		await discoverAgentsForCreate(cwd, rootMode, toolSession.extensionRoots);
 		const rebuildSystemPrompt = async (
 			toolNames: string[],
 			tools: Map<string, AgentTool>,
@@ -2840,6 +3025,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						.trim(),
 				);
 			}
+			if (activeAgentPersona?.systemPrompt) {
+				appendParts.push(activeAgentPersona.systemPrompt);
+			}
 			if (serverInstructions && serverInstructions.size > 0) {
 				appendParts.push(
 					"## MCP Server Instructions\n\nThe following instructions are provided by connected MCP servers. They are server-controlled and may not be verified.",
@@ -2888,9 +3076,25 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				eagerTasksAlways,
 				taskBatch: settings.get("task.batch"),
 				taskMaxConcurrency: settings.get("task.maxConcurrency"),
-				scoutAvailable: isScoutSpawnable(
+				scoutAvailable: isSpawnableScoutInAgents(
+					await (async () => {
+						const snapshot = getDiscoveredAgentsSnapshot(promptCwd, rootMode, toolSession.extensionRoots);
+						if (snapshot) return snapshot;
+						// No snapshot published for this (cwd, mode, roots) yet —
+						// e.g. an interactive `/resume` or `/move` changed the
+						// session cwd after construction. The construction-time
+						// discovery was captured for the creation cwd, and the
+						// switch rebuilds
+						// the target system prompt with it, so a target project
+						// that shadows `scout` as `mode: primary` would still
+						// advertise scout spawning (or hide it when the source
+						// did). Re-run discovery for the live prompt cwd instead
+						// of falling back to the construction-time list (codex
+						// 3742717642).
+						return (await discoverAgentsForCreate(promptCwd, rootMode, toolSession.extensionRoots)).agents;
+					})(),
 					settings.get("task.disabledAgents") as string[] | undefined,
-					options.spawns ?? "*",
+					sessionSpawns,
 				),
 				taskIrcEnabled: !restrictToolNames && isIrcEnabled(settings, options.taskDepth ?? 0),
 				autoQaEnabled: !restrictToolNames && isAutoQaEnabled(settings),
@@ -2979,6 +3183,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			: requestedActiveToolNames.filter(name => !defaultInactiveToolNames.has(name));
 		let initialToolNames = [...initialRequestedActiveToolNames];
 
+		// Baseline tool set for persona overlay restore: what the session would have
+		// without the agent persona's toolNames filter. Computed before alwaysInclude
+		// widening so it matches the non-persona startup path. When the tool set came
+		// from an agent persona's frontmatter (toolNamesFromAgent), the pre-persona
+		// baseline is the full registry default — not the persona's own list — mirroring
+		// the non-persona startup path.
+		const baselineToolNames =
+			options.toolNamesFromAgent === true
+				? toolNamesFromRegistry.filter(name => !defaultInactiveToolNames.has(name) && name !== "goal")
+				: options.toolNames
+					? requestedActiveToolNames.filter(name => !defaultInactiveToolNames.has(name))
+					: undefined;
+
 		// Custom tools and extension-registered tools are always included regardless of toolNames filter.
 		// Restricted callers own the list, so never widen it with registered tools.
 		const alwaysInclude: string[] = restrictToolNames
@@ -2987,8 +3204,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					...sdkCustomTools.map(t => (isCustomTool(t) ? t.name : t.name)),
 					...registeredTools.filter(t => !t.definition.defaultInactive).map(t => t.definition.name),
 				];
+		// When the active set came from a persona's explicit tools: list, the
+		// always-include widening must stay INSIDE that policy — a persona that
+		// grants only `read` must not expose SDK/extension write-like tools at
+		// startup (codex 3741730336). The registry stays full for a future
+		// persona switch; only the startup activation is filtered.
+		const personaPolicyNames = options.toolNamesFromAgent ? new Set(options.toolNames ?? []) : undefined;
 		for (const name of alwaysInclude) {
 			if (toolRegistry.has(name) && !initialToolNames.includes(name)) {
+				if (personaPolicyNames && !personaPolicyNames.has(name)) continue;
 				initialToolNames.push(name);
 			}
 		}
@@ -3038,7 +3262,38 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (mountedNames.length > 0 && !initialToolNames.includes("write")) initialToolNames.push("write");
 		}
 
+		// Snapshot the baseline's xd:// partition for persona-overlay restore. The
+		// overlay restore must bring back the exact top-level vs mounted split a
+		// fresh non-persona startup would produce; setActiveToolsByName() alone
+		// classifies mounts against the persona's current mounted set, so
+		// default-mountable baseline tools the persona never had mounted would come
+		// back top-level instead of under xd://. setActiveToolPresentation expects
+		// the FULL enabled list (mounted names included) plus the mounted subset.
+		let baselineEnabledToolNames: string[] | undefined;
+		let baselineMountedToolNames: string[] | undefined;
+		if (baselineToolNames) {
+			const mounted: string[] = [];
+			if (toolSession.xdev) {
+				for (const name of baselineToolNames) {
+					const tool = toolRegistry.get(name);
+					const explicitlyRequested = explicitlyRequestedToolNameSet?.has(name) === true;
+					if (
+						tool &&
+						xdevReadAvailable &&
+						xdevWriteAvailable &&
+						!explicitlyRequested &&
+						isMountableUnderXdev(tool)
+					)
+						mounted.push(name);
+				}
+			}
+			baselineEnabledToolNames = [...baselineToolNames];
+			if (mounted.length > 0 && !baselineEnabledToolNames.includes("write")) baselineEnabledToolNames.push("write");
+			baselineMountedToolNames = mounted;
+		}
+
 		setActiveToolNames(initialToolNames);
+
 		const { systemPrompt } = await logger.time(
 			"buildSystemPrompt",
 			rebuildSystemPrompt,
@@ -3240,13 +3495,80 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Restore messages if session has existing data
 		if (hasExistingSession) {
 			agent.replaceMessages(existingSession.messages);
+			// Record an explicit startup persona (--agent) on resumed/continued/
+			// forked transcripts too, so the next resume rehydrates it instead of
+			// silently losing the selection to the transcript's prior persona (or
+			// none). Compare name AND source: the same name may resolve to a
+			// different precedence root since the session was saved (e.g. a newly
+			// added project/foo shadowing user/foo), and that switch must be
+			// persisted or the next resume would silently revert.
+			if (
+				options.agentPersona &&
+				(existingSession.agentPersona?.agent !== options.agentPersona.name ||
+					existingSession.agentPersona?.source !== options.agentPersona.source ||
+					// Same identity but the definition content changed since the
+					// transcript was saved (e.g. model:/thinkingLevel: edited): the
+					// live run applies the new defaults, so record the change or the
+					// next resume would rehydrate the stale transcript values.
+					// A stored entry without a fingerprint (legacy write paths) is
+					// unknown content: record the current definition so the next
+					// resume rehydrates this run's values instead of the stale ones.
+					existingSession.agentPersona?.fingerprint === undefined ||
+					existingSession.agentPersona.fingerprint !== personaFingerprint)
+			) {
+				sessionManager.appendAgentChange(
+					options.agentPersona.name,
+					options.agentPersona.source,
+					personaFingerprint,
+				);
+			}
+			// An explicit --agent (fresh selection, not rehydrated) applies its
+			// frontmatter model/thinking for THIS run even when the recorded
+			// identity+fingerprint match and the append above is skipped: the
+			// transcript's model_change/thinking_level_change may postdate the
+			// agent_change (the model was switched in-session later), and without
+			// new entries the next resume rehydrates those older values and
+			// silently reverts the reselection (codex 3742448940). `options.model`
+			// is set by main.ts only for an explicit selection (rehydrated
+			// resumes leave it unset and restore the transcript's own model), so
+			// it cleanly separates the two. The diff guards keep an explicit
+			// resume whose frontmatter resolved to the recorded values from
+			// writing spurious entries. `auto` is included: a persona whose
+			// frontmatter sets `thinkingLevel: auto` runs in auto mode for this
+			// session, and without a `configured: "auto"` entry the next resume
+			// falls back to the transcript's previous selector instead of the
+			// reselected policy (codex 3742662983).
+			if (
+				options.agentPersona &&
+				options.model !== undefined &&
+				model &&
+				formatModelString(model) !== existingSession.models.default
+			) {
+				sessionManager.appendModelChange(formatModelString(model));
+			}
+			if (
+				options.agentPersona &&
+				options.thinkingLevel !== undefined &&
+				effectiveThinkingLevel !== undefined &&
+				String(options.thinkingLevel) !== existingSession.configuredThinkingLevel
+			) {
+				// `auto` persists the concrete provisional effort for the display
+				// plus configured="auto" for the intent — mirroring the
+				// new-session branch (sdk.ts:3529) so the next resume rehydrates
+				// auto mode instead of the transcript's previous selector.
+				sessionManager.appendThinkingLevelChange(
+					effectiveThinkingLevel,
+					options.thinkingLevel === AUTO_THINKING ? AUTO_THINKING : String(options.thinkingLevel),
+				);
+			}
 			if (options.openAIServiceTier !== undefined) {
 				sessionManager.appendServiceTierChange(
 					Object.keys(initialServiceTierByFamily).length > 0 ? initialServiceTierByFamily : null,
 				);
 			}
 		} else {
-			// Save initial model, thinking level, and service tier for new sessions so they can be restored on resume.
+			// Save initial model, thinking level, service tier, and agent persona for new sessions
+			// so they can be restored on resume.
 			if (model) {
 				sessionManager.appendModelChange(`${model.provider}/${model.id}`);
 			}
@@ -3254,10 +3576,26 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				// Do not write the `auto` selector before the first turn resolves; auto
 				// classification persists its concrete effort once a real user turn runs.
 				sessionManager.appendThinkingLevelChange(effectiveThinkingLevel);
+			} else if (options.agentPersona) {
+				// A persona records an agent_change that resume treats as
+				// rehydratable (frontmatter intentionally not reapplied). With no
+				// thinking_level_change on disk the resume falls back to the model/
+				// settings default and silently leaves auto mode, so persist the
+				// configured auto selector here (concrete provisional effort for the
+				// display, configured=auto for the intent). The first turn's
+				// classification still overwrites the concrete effort later.
+				sessionManager.appendThinkingLevelChange(effectiveThinkingLevel, AUTO_THINKING);
 			}
 			if (options.openAIServiceTier !== undefined || Object.keys(initialServiceTierByFamily).length > 0) {
 				sessionManager.appendServiceTierChange(
 					Object.keys(initialServiceTierByFamily).length > 0 ? initialServiceTierByFamily : null,
+				);
+			}
+			if (options.agentPersona) {
+				sessionManager.appendAgentChange(
+					options.agentPersona.name,
+					options.agentPersona.source,
+					personaFingerprint,
 				);
 			}
 		}
@@ -3339,7 +3677,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			initialAdvisorCosts,
 			settings,
 			autoApprove: options.autoApprove,
-			scoutAllowedBySpawnPolicy: isScoutSpawnable(undefined, options.spawns ?? "*"),
 			evalKernelOwnerId,
 			// Defined only for top-level sessions (creation is gated above).
 			// AgentSession uses this to decide whether it may dispose the global
@@ -3392,6 +3729,28 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			xdev: toolSession.xdev,
 			presentationPinnedToolNames: explicitlyRequestedToolNameSet,
 			setActiveToolNames,
+			setSessionSpawns: (spawns: string) => {
+				sessionSpawns = spawns;
+			},
+			getSessionSpawns: () => sessionSpawns,
+			baselineSpawns: options.spawns ?? "*",
+			getExtensionDiscoveryMode: () => rootMode,
+			extensionPaths,
+			extensionRoots: toolSession.extensionRoots,
+			setAgentPersona: (agent: AgentDefinition | undefined) => {
+				activeAgentPersona = agent;
+			},
+			agentPersona: options.agentPersona,
+			cliToolsLocked: options.cliToolsLocked,
+			cliModelLocked: options.cliModelLocked,
+			cliThinkingLocked: options.cliThinkingLocked,
+			toolNamesFromAgent: options.toolNamesFromAgent,
+			initialToolOverlayRestore:
+				options.agentPersona?.tools?.length && baselineEnabledToolNames && baselineMountedToolNames
+					? async () => {
+							await session.setActiveToolPresentation(baselineEnabledToolNames!, baselineMountedToolNames!);
+						}
+					: undefined,
 			ensureWriteRegistered,
 			getMcpServerInstructions: mcpManager
 				? () => {
@@ -3433,6 +3792,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			titleSystemPrompt: options.titleSystemPrompt,
 		});
 		hasSession = true;
+
 		session.yieldQueue.register<McpNotificationEntry>("mcp-notification", {
 			build: buildMcpNotificationBatchMessage,
 		});

@@ -33,6 +33,7 @@ import {
 } from "./messages";
 import { type BuildSessionContextOptions, buildSessionContext, type SessionContext } from "./session-context";
 import {
+	type AgentChangeEntry,
 	type BranchSummaryEntry,
 	type CompactionEntry,
 	type CredentialPinEntry,
@@ -181,6 +182,7 @@ function isDraftOnlyMetadataEntry(entry: SessionEntry): boolean {
 		case "thinking_level_change":
 		case "service_tier_change":
 		case "mode_change":
+		case "agent_change":
 		case "credential_pin":
 			return true;
 		default:
@@ -2125,6 +2127,18 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	appendAgentChange(agent: string, source: "bundled" | "user" | "project", fingerprint?: string): string {
+		const entry: AgentChangeEntry = {
+			type: "agent_change",
+			...this.#freshEntryFields(),
+			agent,
+			source,
+			...(fingerprint !== undefined ? { fingerprint } : {}),
+		};
+		this.#recordEntry(entry);
+		return entry.id;
+	}
+
 	appendSessionInit(init: {
 		systemPrompt: string;
 		task: string;
@@ -2138,6 +2152,8 @@ export class SessionManager {
 		restrictToolNames?: boolean;
 		spawns?: string;
 		readSummarize?: boolean;
+		disableExtensionDiscovery?: boolean;
+		extensionRoots?: string[];
 	}): string {
 		const entry: SessionInitEntry = { type: "session_init", ...this.#freshEntryFields(), ...init };
 		this.#recordEntry(entry);
@@ -2630,6 +2646,8 @@ export class SessionManager {
 			restrictToolNames?: boolean;
 			spawns?: string;
 			readSummarize?: boolean;
+			disableExtensionDiscovery?: boolean;
+			extensionRoots?: string[];
 		} | null;
 	} | null> {
 		let loaded: FileEntry[];
@@ -2653,6 +2671,8 @@ export class SessionManager {
 			restrictToolNames?: boolean;
 			spawns?: string;
 			readSummarize?: boolean;
+			disableExtensionDiscovery?: boolean;
+			extensionRoots?: string[];
 		} | null = null;
 		for (let index = loaded.length - 1; index >= 0; index--) {
 			const entry = loaded[index];
@@ -2669,6 +2689,8 @@ export class SessionManager {
 					restrictToolNames: entry.restrictToolNames,
 					readSummarize: entry.readSummarize,
 					spawns: entry.spawns,
+					disableExtensionDiscovery: entry.disableExtensionDiscovery,
+					extensionRoots: entry.extensionRoots,
 				};
 				break;
 			}

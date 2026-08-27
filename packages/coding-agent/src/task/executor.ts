@@ -434,11 +434,26 @@ export interface ExecutorOptions {
 	 */
 	preloadedExtensionPaths?: string[];
 	/**
+	 * Parent's explicit extension-package ROOT directories (resolved),
+	 * distinct from {@link preloadedExtensionPaths} (entry files). Forwarded
+	 * so the subagent's agent/skill discovery keeps resolving
+	 * `pack/agents/*.md` after the parent's invocation scope is gone.
+	 */
+	preloadedExtensionRoots?: string[];
+	/**
 	 * Parent's discovered custom-tool source paths. Forwarded to skip the
 	 * `.omp/tools/` FS scan in the subagent; the subagent then re-binds each
 	 * tool against its own `CustomToolAPI` (cwd, exec, pushPendingAction, UI).
 	 */
 	preloadedCustomToolPaths?: ToolPathWithSource[];
+	/**
+	 * Whether the parent session was launched with extension discovery disabled
+	 * (`--no-extensions`, rootMode "explicit-only"). Forwarded so the subagent
+	 * session enforces the same root scope: its agent discovery, task tool, and
+	 * scout availability must not surface ambient plugin agents the parent
+	 * suppressed.
+	 */
+	disableExtensionDiscovery?: boolean;
 	mcpManager?: MCPManager;
 	authStorage?: AuthStorage;
 	modelRegistry?: ModelRegistry;
@@ -2679,8 +2694,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let toolNames: string[] | undefined;
 	if (agent.tools && agent.tools.length > 0) {
 		toolNames = agent.tools;
-		// Auto-include task tool if spawns defined but task not in tools
-		if (agent.spawns !== undefined && !toolNames.includes("task") && !atMaxDepth) {
+		// Auto-include task tool if spawns are actually enabled (a non-empty
+		// list — `spawns: []`/`spawns: ""` explicitly disables spawning, and
+		// advertising a task tool whose every call would error is a trap) but
+		// task not in tools.
+		if (agent.spawns !== undefined && agent.spawns.length > 0 && !toolNames.includes("task") && !atMaxDepth) {
 			toolNames = [...toolNames, "task"];
 		}
 	}
@@ -3030,6 +3048,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				workspaceTree: options.workspaceTree,
 				rules: options.rules,
 				preloadedExtensionPaths: restrictToolNames ? [] : options.preloadedExtensionPaths,
+				preloadedExtensionRoots: restrictToolNames ? [] : options.preloadedExtensionRoots,
 				preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
 				systemPrompt: defaultPrompt => {
 					const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
@@ -3065,6 +3084,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				enableMCP,
 				mcpManager,
 				customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
+				disableExtensionDiscovery: options.disableExtensionDiscovery,
 				localProtocolOptions: options.localProtocolOptions,
 				telemetry: subagentTelemetry,
 				parentEvalSessionId: options.parentEvalSessionId,
@@ -3153,6 +3173,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				outputSchema,
 				outputSchemaMode: options.outputSchemaMode,
 				restrictToolNames: restrictToolNames || undefined,
+				disableExtensionDiscovery:
+					options.disableExtensionDiscovery || session.getExtensionDiscoveryMode?.() === "explicit-only",
+				extensionRoots: session.extensionRoots,
 			});
 
 			abortSignal.addEventListener(

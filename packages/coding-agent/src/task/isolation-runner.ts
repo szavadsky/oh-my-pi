@@ -166,6 +166,12 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 			...opts.baseOptions,
 			worktree: isolationDir,
 			preloadedExtensionPaths: undefined,
+			// Entry-file paths are cleared (the worktree may not contain the
+			// parent's entry modules), but explicit extension-package ROOTS are
+			// external directories (e.g. ~/pack) that stay valid under the
+			// worktree cwd. Forward them so an explicit-only/SDK parent's pack
+			// agents keep resolving in the isolated child (adv review finding).
+			preloadedExtensionRoots: opts.baseOptions.preloadedExtensionRoots,
 			preloadedCustomToolPaths: undefined,
 			onCleanupDeferred: completion => {
 				deferredCleanup = completion;

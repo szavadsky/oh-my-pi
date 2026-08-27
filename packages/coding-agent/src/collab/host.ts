@@ -87,6 +87,7 @@ const WIRE_SESSION_ENTRY_TYPES: Record<WireSessionEntry["type"], true> = {
 	branch_summary: true,
 	model_change: true,
 	thinking_level_change: true,
+	agent_change: true,
 };
 const COLLAB_BUS_CHANNELS = [
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,

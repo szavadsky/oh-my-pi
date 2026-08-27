@@ -117,6 +117,15 @@ export interface ModeChangeEntry extends SessionEntryBase {
 	data?: Record<string, unknown>;
 }
 
+/** Agent persona change entry - tracks main-session agent persona selection for resume. */
+export interface AgentChangeEntry extends SessionEntryBase {
+	type: "agent_change";
+	/** Agent name (from AgentDefinition.name). */
+	agent: string;
+	/** Agent source for disambiguation. */
+	source: "bundled" | "user" | "project";
+}
+
 export interface CustomCompactionSessionEntries {}
 
 export type SessionEntry =
@@ -133,6 +142,7 @@ export type SessionEntry =
 	| TtsrInjectionEntry
 	| SessionInitEntry
 	| ModeChangeEntry
+	| AgentChangeEntry
 	| CustomCompactionSessionEntries[keyof CustomCompactionSessionEntries];
 
 export interface ReadonlySessionManager {

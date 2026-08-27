@@ -66,8 +66,31 @@ async function loadAgentsFromDir(dir: string, source: AgentSource): Promise<Agen
  * installed npm/link plugins), Claude marketplace plugin agents (project
  * scope before user), then bundled.
  * @param cwd - Current working directory for project agent discovery
+ * @param home - Home directory for user-level and extension/plugin agent discovery
+ * @param options - Discovery options
+ * @param options.includeExtensions - When false, skips OMP extension-package and
+ *   Claude marketplace plugin agent roots (default true)
+ * @param options.extensionMode - When "explicit-only", includes only
+ *   explicitly-requested OMP extension roots (CLI -e/--hook) and skips Claude
+ *   marketplace plugins; used with --no-extensions so explicit packages stay
+ *   discoverable while ambient roots are suppressed
  */
-export async function discoverAgents(cwd: string, home: string = os.homedir()): Promise<DiscoveryResult> {
+export async function discoverAgents(
+	cwd: string,
+	home: string = os.homedir(),
+	options?: {
+		includeExtensions?: boolean;
+		extensionMode?: "merge" | "explicit-only";
+		/**
+		 * Session-persisted explicit extension-package roots (resolved paths).
+		 * SDK sessions pass `additionalExtensionPaths` (and subagents inherit
+		 * `preloadedExtensionPaths`); those live in the construction-time ALS
+		 * scope only, so task-time rediscovery must supply them explicitly or
+		 * the agents/skills they ship vanish mid-session ("Unknown agent").
+		 */
+		extensionRoots?: readonly string[];
+	},
+): Promise<DiscoveryResult> {
 	const resolvedCwd = path.resolve(cwd);
 
 	const userDirs = getConfigDirs("agents", { project: false })
@@ -97,24 +120,33 @@ export async function discoverAgents(cwd: string, home: string = os.homedir()): 
 	// `task` agent surface dedups identically to the sibling skills/hooks/tools
 	// surface in `discovery/omp-plugins.ts`. Gate on `omp-plugins` so
 	// disabledProviders suppresses the whole extension-package surface.
-	const extensionRoots = isProviderEnabled("omp-plugins")
-		? await listOmpExtensionRoots({ cwd: resolvedCwd, home, repoRoot: null })
-		: [];
-	for (const root of extensionRoots) {
-		orderedDirs.push({ dir: path.join(root.path, "agents"), source: root.level });
-	}
+	if (options?.includeExtensions !== false) {
+		const extensionRoots = isProviderEnabled("omp-plugins")
+			? await listOmpExtensionRoots(
+					{ cwd: resolvedCwd, home, repoRoot: null },
+					{ mode: options?.extensionMode, explicitRoots: options?.extensionRoots },
+				)
+			: [];
+		for (const root of extensionRoots) {
+			orderedDirs.push({ dir: path.join(root.path, "agents"), source: root.level });
+		}
 
-	// Load agents from Claude Code marketplace plugins (respects disabledProviders)
-	const { roots: pluginRoots } = isProviderEnabled("claude-plugins")
-		? await listClaudePluginRoots(home, resolvedCwd)
-		: { roots: [] };
-	const sortedPluginRoots = [...pluginRoots].sort((a, b) => {
-		if (a.scope === b.scope) return 0;
-		return a.scope === "project" ? -1 : 1;
-	});
-	for (const plugin of sortedPluginRoots) {
-		const agentsDir = path.join(plugin.path, "agents");
-		orderedDirs.push({ dir: agentsDir, source: plugin.scope === "project" ? "project" : "user" });
+		// Load agents from Claude Code marketplace plugins (respects disabledProviders).
+		// explicit-only mode keeps marketplace installs out: --no-extensions must
+		// not surface ambient plugins, only roots the CLI invocation named.
+		if (options?.extensionMode !== "explicit-only") {
+			const { roots: pluginRoots } = isProviderEnabled("claude-plugins")
+				? await listClaudePluginRoots(home, resolvedCwd)
+				: { roots: [] };
+			const sortedPluginRoots = [...pluginRoots].sort((a, b) => {
+				if (a.scope === b.scope) return 0;
+				return a.scope === "project" ? -1 : 1;
+			});
+			for (const plugin of sortedPluginRoots) {
+				const agentsDir = path.join(plugin.path, "agents");
+				orderedDirs.push({ dir: agentsDir, source: plugin.scope === "project" ? "project" : "user" });
+			}
+		}
 	}
 
 	const seen = new Set<string>();

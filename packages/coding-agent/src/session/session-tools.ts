@@ -60,6 +60,13 @@ export interface SessionToolsHost {
 	/** Session-scoped `/vision` override; undefined means "follow the persisted setting". */
 	getInspectImageModeOverride(): InspectImageMode | undefined;
 	setInspectImageModeOverride(mode: InspectImageMode | undefined): void;
+	/**
+	 * The active persona's explicit tool allow-list, when one is installed
+	 * (undefined = unrestricted). Deferred tool refreshes (MCP connect/
+	 * reconnect, RPC rebinds) must stay inside this policy instead of
+	 * unconditionally activating every discovered tool.
+	 */
+	getPersonaToolPolicy(): string[] | undefined;
 }
 
 interface SessionToolsOptions {
@@ -928,6 +935,18 @@ export class SessionTools {
 		);
 	}
 
+	/** Snapshots the current tool set, applies a new one, and returns a restore handle. */
+	async applyToolOverlay(toolNames: string[]): Promise<{ restore: () => Promise<void> }> {
+		const previous = this.getEnabledToolNames();
+		const previousMounted = this.getMountedXdevToolNames();
+		await this.setActiveToolsByName(toolNames);
+		return {
+			restore: async () => {
+				await this.setActiveToolPresentation(previous, previousMounted);
+			},
+		};
+	}
+
 	/**
 	 * Restore an enabled tool set with its exact top-level versus `xd://` partition.
 	 *
@@ -1349,9 +1368,16 @@ export class SessionTools {
 			this.#toolRegistry.set(finalTool.name, finalTool);
 		}
 
-		// Every connected MCP tool is selected; centralized repartitioning owns
-		// presentation pins and write-transport activation/removal.
-		const nextActive = [...new Set([...this.#getActiveNonMCPToolNames(), ...uniqueMcpTools.map(tool => tool.name)])];
+		// Every connected MCP tool is selected UNLESS an active persona pins an
+		// explicit tool list: the overlay is the persona's granted policy, so
+		// deferred MCP discovery must not broaden the catalog past it (codex
+		// 3741691577). Register the tools (the model can still see/describe
+		// them for a future persona switch) but keep them out of the active set.
+		const personaPolicy = this.#host.getPersonaToolPolicy();
+		const allowedMcpToolNames = personaPolicy
+			? uniqueMcpTools.map(tool => tool.name).filter(name => personaPolicy.includes(name))
+			: uniqueMcpTools.map(tool => tool.name);
+		const nextActive = [...new Set([...this.#getActiveNonMCPToolNames(), ...allowedMcpToolNames])];
 		try {
 			await this.applyActiveToolsByName(nextActive);
 			if (this.#host.isDisposed()) restorePreviousMcpTools();
@@ -1402,9 +1428,14 @@ export class SessionTools {
 		const preservedRpcToolNames = previousActiveToolNames.filter(
 			name => previousRpcHostToolNames.has(name) && this.#rpcHostToolNames.has(name),
 		);
+		const personaPolicy = this.#host.getPersonaToolPolicy();
 		const autoActivatedRpcToolNames = rpcTools
 			.filter(tool => !tool.hidden && !previousRpcHostToolNames.has(tool.name))
-			.map(tool => tool.name);
+			.map(tool => tool.name)
+			// The persona's explicit tools: policy stays authoritative for
+			// deferred host refreshes too, mirroring the MCP refresh gate
+			// (codex 3741758358).
+			.filter(name => personaPolicy === undefined || personaPolicy.includes(name));
 		try {
 			await this.applyActiveToolsByName(
 				Array.from(new Set([...activeNonRpcToolNames, ...preservedRpcToolNames, ...autoActivatedRpcToolNames])),

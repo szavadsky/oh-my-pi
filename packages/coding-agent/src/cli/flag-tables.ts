@@ -132,6 +132,9 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 	"--provider": (result, value) => {
 		result.provider = value;
 	},
+	"--agent": (result, value) => {
+		result.agent = value;
+	},
 	"--model": (result, value) => {
 		result.model = value;
 	},

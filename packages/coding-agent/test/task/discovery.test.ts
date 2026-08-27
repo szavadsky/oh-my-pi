@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { disableProvider, enableProvider } from "@oh-my-pi/pi-coding-agent/capability";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
+import { clearClaudePluginRootsCache } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import {
 	clearOmpExtensionCliRoots,
 	injectOmpExtensionCliRoots,
@@ -38,6 +39,14 @@ const CLAUDE_AGENT_MD = [
 	"You are a Claude Code custom subagent.",
 ].join("\n");
 
+const PLUGIN_AGENT_MD = [
+	"---",
+	"name: simplifier",
+	"description: A code simplifier agent from a Claude plugin",
+	"---",
+	"Simplify code.",
+].join("\n");
+
 async function writeOmpPluginAgent(home: string): Promise<void> {
 	const userPluginsRoot = path.join(home, ".omp", "plugins");
 	const pluginRoot = path.join(userPluginsRoot, "node_modules", "loom");
@@ -70,6 +79,7 @@ describe("discoverAgents", () => {
 	afterEach(async () => {
 		enableProvider("omp-plugins");
 		clearOmpExtensionCliRoots();
+		clearClaudePluginRootsCache();
 		clearFsCache();
 		await removeWithRetries(tempHome);
 	});
@@ -108,6 +118,56 @@ describe("discoverAgents", () => {
 		const names = agents.map(agent => agent.name);
 
 		expect(names).not.toContain("loom-verify-spec");
+	});
+
+	test("includeExtensions: false skips extension-package and Claude plugin agent roots", async () => {
+		// OMP extension-package fixture: npm plugin under <home>/.omp/plugins/node_modules
+		await writeOmpPluginAgent(tempHome);
+
+		// Claude marketplace plugin fixture
+		const pluginInstallPath = path.join(tempHome, "plugin-cache", "code-simplifier");
+		await fs.mkdir(path.join(pluginInstallPath, "agents"), { recursive: true });
+		await fs.writeFile(path.join(pluginInstallPath, "agents", "simplifier.md"), PLUGIN_AGENT_MD);
+		const claudePluginsDir = path.join(tempHome, ".claude", "plugins");
+		await fs.mkdir(claudePluginsDir, { recursive: true });
+		await fs.writeFile(
+			path.join(claudePluginsDir, "installed_plugins.json"),
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"code-simplifier@claude-plugins-official": [
+						{
+							installPath: pluginInstallPath,
+							version: "1.0.0",
+							scope: "user",
+							installedAt: "2025-01-01T00:00:00Z",
+							lastUpdated: "2025-01-01T00:00:00Z",
+						},
+					],
+				},
+			}),
+		);
+		clearClaudePluginRootsCache();
+
+		// Project agent must still resolve
+		await fs.mkdir(path.join(projectDir, ".omp", "agents"), { recursive: true });
+		await fs.writeFile(path.join(projectDir, ".omp", "agents", "omp-test-agent.md"), OMP_AGENT_MD);
+
+		// Sanity: default discovery still surfaces both extension agents
+		const withExtensions = await discoverAgents(projectDir, tempHome);
+		expect(withExtensions.agents.map(a => a.name)).toEqual(
+			expect.arrayContaining(["loom-verify-spec", "simplifier"]),
+		);
+
+		// Contract: includeExtensions: false excludes both extension roots while
+		// project and bundled agents still resolve
+		const { agents } = await discoverAgents(projectDir, tempHome, { includeExtensions: false });
+		const names = agents.map(agent => agent.name);
+		expect(names).not.toContain("loom-verify-spec");
+		expect(names).not.toContain("simplifier");
+		expect(names).toContain("omp-test-agent");
+		expect(names).toContain("task");
+		expect(names).toContain("sonic");
 	});
 
 	test("CLI extension agents win over project `extensions:` settings on dedup", async () => {
@@ -170,5 +230,112 @@ describe("discoverAgents", () => {
 
 		expect(names).toContain("explicit-agent");
 		expect(names).not.toEqual(expect.arrayContaining(["stale-agent", "settings-agent", "loom-verify-spec"]));
+	});
+
+	test("explicit-only extension mode keeps CLI roots but drops market plugins under includeExtensions: false", async () => {
+		const explicitExt = path.join(tempHome, "explicit-ext");
+		await fs.mkdir(path.join(explicitExt, "agents"), { recursive: true });
+		await fs.writeFile(
+			path.join(explicitExt, "agents", "explicit-agent.md"),
+			["---", "name: explicit-agent", "description: explicitly requested", "---", "body"].join("\n"),
+		);
+		injectOmpExtensionCliRoots([explicitExt], tempHome, projectDir, { mode: "explicit-only", replace: true });
+
+		// Claude marketplace plugin fixture — must stay out under explicit-only
+		const pluginInstallPath = path.join(tempHome, "plugin-cache", "code-simplifier");
+		await fs.mkdir(path.join(pluginInstallPath, "agents"), { recursive: true });
+		await fs.writeFile(path.join(pluginInstallPath, "agents", "simplifier.md"), PLUGIN_AGENT_MD);
+		const claudePluginsDir = path.join(tempHome, ".claude", "plugins");
+		await fs.mkdir(claudePluginsDir, { recursive: true });
+		await fs.writeFile(
+			path.join(claudePluginsDir, "installed_plugins.json"),
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"code-simplifier@claude-plugins-official": [
+						{
+							installPath: pluginInstallPath,
+							version: "1.0.0",
+							scope: "user",
+							installedAt: "2025-01-01T00:00:00Z",
+							lastUpdated: "2025-01-01T00:00:00Z",
+						},
+					],
+				},
+			}),
+		);
+		clearClaudePluginRootsCache();
+
+		const { agents } = await discoverAgents(projectDir, tempHome, {
+			includeExtensions: true,
+			extensionMode: "explicit-only",
+		});
+		const names = agents.map(agent => agent.name);
+
+		expect(names).toContain("explicit-agent");
+		expect(names).not.toContain("simplifier");
+	});
+
+	test("explicit-only extensionMode option suppresses ambient OMP roots outside the injected scope", async () => {
+		// Global injected mode stays "merge": the explicit-only signal must come
+		// from the discovery call's own extensionMode option (dashboard reloads,
+		// refreshAgentDiscovery, and structured-subagent preflight run outside
+		// the SDK's withOmpExtensionRootScope).
+		const ambientExt = path.join(tempHome, "ambient-ext");
+		await fs.mkdir(path.join(ambientExt, "agents"), { recursive: true });
+		await fs.writeFile(
+			path.join(ambientExt, "agents", "ambient-ext-agent.md"),
+			["---", "name: ambient-ext-agent", "description: from settings extensions", "---", "body"].join("\n"),
+		);
+		await fs.mkdir(path.join(projectDir, ".omp"), { recursive: true });
+		await fs.writeFile(path.join(projectDir, ".omp", "settings.json"), JSON.stringify({ extensions: [ambientExt] }));
+		await writeOmpPluginAgent(tempHome);
+
+		const explicitExt = path.join(tempHome, "explicit-ext");
+		await fs.mkdir(path.join(explicitExt, "agents"), { recursive: true });
+		await fs.writeFile(
+			path.join(explicitExt, "agents", "explicit-agent.md"),
+			["---", "name: explicit-agent", "description: explicitly requested", "---", "body"].join("\n"),
+		);
+		injectOmpExtensionCliRoots([explicitExt], tempHome, projectDir);
+
+		const { agents } = await discoverAgents(projectDir, tempHome, {
+			includeExtensions: true,
+			extensionMode: "explicit-only",
+		});
+		const names = agents.map(agent => agent.name);
+
+		expect(names).toContain("explicit-agent");
+		// Ambient OMP roots (settings extension + installed plugin) must not
+		// surface even though the global injected mode is still "merge".
+		expect(names).not.toEqual(expect.arrayContaining(["ambient-ext-agent", "loom-verify-spec"]));
+	});
+
+	test("extensionRoots resolves pack agents even when entry files would not", async () => {
+		// Codex 3741581909: session.extensionPaths holds ENTRY files
+		// (pack/index.ts); discovery roots must be the PACKAGE DIRECTORY
+		// (pack/), or listOmpExtensionRoots filters them as non-directories
+		// and pack/agents/*.md vanishes at task time.
+		const packRoot = path.join(tempHome, "explicit-pack");
+		await fs.mkdir(path.join(packRoot, "agents"), { recursive: true });
+		await fs.writeFile(
+			path.join(packRoot, "agents", "pack-agent.md"),
+			["---", "name: pack-agent", "description: from explicit pack agents dir", "---", "body"].join("\n"),
+		);
+
+		// Entry-file spelling alone must NOT surface the pack agent: the root
+		// lookup filters non-directories.
+		const { agents: viaEntry } = await discoverAgents(projectDir, tempHome, {
+			includeExtensions: true,
+			extensionRoots: [path.join(packRoot, "index.ts")],
+		});
+		expect(viaEntry.map(agent => agent.name)).not.toContain("pack-agent");
+
+		// Package-root spelling DOES surface it.
+		const { agents: viaRoot } = await discoverAgents(projectDir, tempHome, {
+			includeExtensions: true,
+			extensionRoots: [packRoot],
+		});
+		expect(viaRoot.map(agent => agent.name)).toContain("pack-agent");
 	});
 });

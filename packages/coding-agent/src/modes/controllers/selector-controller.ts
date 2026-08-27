@@ -60,6 +60,7 @@ import {
 	toResetUsageAccounts,
 } from "../../slash-commands/helpers/reset-usage";
 import { toSessionPinAccounts } from "../../slash-commands/helpers/session-pin";
+import { discoverAgents } from "../../task/discovery";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -82,6 +83,7 @@ import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { type AdvisorConfigDeps, AdvisorConfigOverlayComponent } from "../components/advisor-config";
 import { AgentDashboard } from "../components/agent-dashboard";
 import { AgentHubOverlayComponent } from "../components/agent-hub";
+import { AgentPersonaPickerComponent } from "../components/agent-persona-picker";
 import { AssistantMessageComponent } from "../components/assistant-message";
 import { CopySelectorComponent } from "../components/copy-selector";
 import { ExtensionDashboard } from "../components/extensions";
@@ -395,11 +397,18 @@ export class SelectorController {
 		const activeModel = this.ctx.session.model;
 		const activeModelPattern = activeModel ? `${activeModel.provider}/${activeModel.id}` : undefined;
 		const defaultModelPattern = this.ctx.settings.getModelRole("default");
-		const dashboard = await AgentDashboard.create(getProjectDir(), this.ctx.settings, this.ctx.ui.terminal.rows, {
-			modelRegistry: this.ctx.session.modelRegistry,
-			activeModelPattern,
-			defaultModelPattern,
-		});
+		const dashboard = await AgentDashboard.create(
+			getProjectDir(),
+			this.ctx.settings,
+			this.ctx.ui.terminal.rows,
+			{
+				modelRegistry: this.ctx.session.modelRegistry,
+				activeModelPattern,
+				defaultModelPattern,
+			},
+			() => this.ctx.session.getExtensionDiscoveryMode(),
+			this.ctx.session.extensionRoots,
+		);
 		const overlay = this.ctx.ui.showOverlay(dashboard, {
 			width: "100%",
 			maxHeight: "100%",
@@ -699,6 +708,63 @@ export class SelectorController {
 			return;
 		}
 		this.#showModelHub({});
+	}
+
+	async showAgentPersonaSelector(): Promise<void> {
+		if (this.ctx.goalModeEnabled) {
+			this.ctx.showWarning("Cannot switch agent during goal mode. Exit goal mode first.");
+			return;
+		}
+		if (this.ctx.vibeModeEnabled) {
+			this.ctx.showWarning("Cannot switch agent during vibe mode. Exit vibe mode first.");
+			return;
+		}
+		// Rediscover under the session's extension mode so a --no-extensions
+		// session's picker cannot offer extension/plugin personas startup suppressed.
+		const discovery = await discoverAgents(this.ctx.sessionManager.getCwd(), undefined, {
+			includeExtensions: true,
+			extensionMode: this.ctx.session.getExtensionDiscoveryMode(),
+			extensionRoots: this.ctx.session.extensionRoots,
+		});
+		const disabled = new Set((this.ctx.settings.get("task.disabledAgents") as string[] | undefined) ?? []);
+		const available = discovery.agents.filter(a => a.availability !== "subagent" && !disabled.has(a.name));
+		if (available.length === 0) {
+			this.ctx.showStatus("No selectable agent personas found.");
+			return;
+		}
+
+		let overlayHandle: OverlayHandle | undefined;
+		let closed = false;
+		const done = () => {
+			if (closed) return;
+			closed = true;
+			overlayHandle?.hide();
+			this.focusActiveEditorArea();
+			this.ctx.ui.requestRender();
+		};
+
+		const picker = new AgentPersonaPickerComponent(this.ctx.ui, available, this.ctx.session.agentPersona?.name, {
+			onSelect: async agent => {
+				try {
+					await this.ctx.session.switchAgentPersona(agent);
+					this.ctx.statusLine.invalidate();
+					this.ctx.updateEditorBorderColor();
+					this.ctx.showStatus(`Switched to agent persona "${agent.name}".`);
+					done();
+				} catch (error) {
+					this.ctx.showError(error instanceof Error ? error.message : String(error));
+				}
+			},
+			onCancel: done,
+		});
+		overlayHandle = this.ctx.ui.showOverlay(picker, {
+			anchor: "bottom-center",
+			width: "100%",
+			maxHeight: "100%",
+			margin: 0,
+		});
+		this.ctx.ui.setFocus(picker);
+		this.ctx.ui.requestRender();
 	}
 
 	/**

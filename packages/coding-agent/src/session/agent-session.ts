@@ -101,7 +101,7 @@ import { type AdvisorConfig, type AdvisorRuntimeStatus, loadAdvisorTranscriptCos
 import { type AsyncJob, AsyncJobManager } from "../async";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
 import type { ModelRegistry } from "../config/model-registry";
-import type { ResolvedModelRoleValue } from "../config/model-resolver";
+import { type ResolvedModelRoleValue, resolveModelOverride } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily } from "../config/service-tier";
 import type { Settings, SkillsSettings } from "../config/settings";
@@ -176,6 +176,10 @@ import {
 	obfuscateProviderContext,
 } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
+import { fingerprintAgentContent, resolveAgentSessionPolicy } from "../task/agent-policy";
+import { discoverAgents, getAgent } from "../task/discovery";
+import { scoutAvailableFromState } from "../task/spawn-policy";
+import type { AgentDefinition } from "../task/types";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -531,7 +535,6 @@ export class AgentSession {
 	// Agent identity (registry id) used for IRC routing and job ownership.
 	#agentId: string | undefined;
 	#agentKind: "main" | "sub" = "main";
-	#scoutAllowedBySpawnPolicy = true;
 	#providerSessionId: string | undefined;
 	#freshProviderSessionId: string | undefined;
 	#inheritedProviderPromptCacheKey: string | undefined;
@@ -626,6 +629,19 @@ export class AgentSession {
 	#synchronouslyTerminatedYieldToolCallIds = new Set<string>();
 	#providerSessionState = new Map<string, ProviderSessionState>();
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
+	#agentPersona: AgentDefinition | undefined;
+	#setAgentPersona: ((agent: AgentDefinition | undefined) => void) | undefined;
+	#getSessionSpawns: (() => string | undefined) | undefined;
+	#setSessionSpawns: ((spawns: string) => void) | undefined;
+	#baselineSpawns = "*";
+	#getExtensionDiscoveryMode: (() => "explicit-only" | "merge") | undefined;
+	#extensionPaths: string[] | undefined;
+	#extensionRoots: string[] | undefined;
+	#agentToolOverlay: { restore: () => Promise<void> } | undefined;
+	#personaToolPolicy: string[] | undefined;
+	#cliToolsLocked = false;
+	#cliModelLocked = false;
+	#cliThinkingLocked = false;
 	readonly #memory: SessionMemory;
 	readonly rawSseDebugBuffer: RawSseDebugBuffer;
 
@@ -1234,6 +1250,7 @@ export class AgentSession {
 			setInspectImageModeOverride: mode => {
 				this.#inspectImageModeOverride = mode;
 			},
+			getPersonaToolPolicy: () => this.#personaToolPolicy,
 		};
 		this.#tools = new SessionTools(sessionToolsHost, {
 			autoApprove: config.autoApprove,
@@ -1267,6 +1284,26 @@ export class AgentSession {
 		};
 		this.#ttsr = new TtsrCoordinator(ttsrHost, config.ttsrManager);
 		this.#obfuscator = config.obfuscator;
+		this.#agentPersona = config.agentPersona;
+		this.#setAgentPersona = config.setAgentPersona;
+		this.#getSessionSpawns = config.getSessionSpawns;
+		this.#setSessionSpawns = config.setSessionSpawns;
+		this.#baselineSpawns = config.baselineSpawns ?? "*";
+		this.#getExtensionDiscoveryMode = config.getExtensionDiscoveryMode;
+		this.#extensionPaths = config.extensionPaths;
+		this.#extensionRoots = config.extensionRoots;
+		this.#cliToolsLocked = config.cliToolsLocked ?? false;
+		this.#cliModelLocked = config.cliModelLocked ?? false;
+		this.#cliThinkingLocked = config.cliThinkingLocked ?? false;
+		if (
+			config.toolNamesFromAgent === true &&
+			config.agentPersona?.tools?.length &&
+			config.initialToolOverlayRestore
+		) {
+			this.#agentToolOverlay = { restore: config.initialToolOverlayRestore };
+			const startupPolicy = resolveAgentSessionPolicy(config.agentPersona);
+			this.#personaToolPolicy = startupPolicy.toolNames;
+		}
 		const providerBoundaryHost: SessionProviderBoundaryHost = {
 			agent: this.agent,
 			sessionManager: this.sessionManager,
@@ -1300,7 +1337,6 @@ export class AgentSession {
 		this.#loopGuards = new LoopGuards(streamGuardsHost);
 		this.#agentId = config.agentId;
 		this.#agentKind = config.agentKind ?? "main";
-		this.#scoutAllowedBySpawnPolicy = config.scoutAllowedBySpawnPolicy ?? true;
 		this.#providerSessionId = config.providerSessionId;
 		this.#inheritedProviderPromptCacheKey =
 			config.providerPromptCacheKeySource === "fork" ? this.agent.promptCacheKey : undefined;
@@ -4173,6 +4209,11 @@ export class AgentSession {
 		return this.#models.thinkingLevel;
 	}
 
+	/** The active agent persona, if any. */
+	get agentPersona(): AgentDefinition | undefined {
+		return this.#agentPersona;
+	}
+
 	/** The selector the user configured: `auto` when auto mode is active, else the effective level. */
 	configuredThinkingLevel(): ConfiguredThinkingLevel | undefined {
 		return this.#models.configuredThinkingLevel();
@@ -4281,6 +4322,25 @@ export class AgentSession {
 		return this.#tools.getMountedXdevToolNames();
 	}
 
+	/**
+	 * Extension-agent discovery mode this session was started with: "explicit-only"
+	 * under --no-extensions (only CLI-named roots), "merge" otherwise. Live /agent
+	 * lookups and the persona picker rediscover under this same mode.
+	 */
+	getExtensionDiscoveryMode(): "explicit-only" | "merge" {
+		return this.#getExtensionDiscoveryMode?.() ?? "merge";
+	}
+
+	/** Resolved explicit extension-package root paths (additionalExtensionPaths / preloadedExtensionPaths). */
+	get extensionPaths(): string[] | undefined {
+		return this.#extensionPaths;
+	}
+
+	/** Explicit extension-package ROOT directories (resolved), distinct from entry-file extensionPaths. */
+	get extensionRoots(): string[] | undefined {
+		return this.#extensionRoots;
+	}
+
 	/** Whether the edit tool is registered in this session. */
 	get hasEditTool(): boolean {
 		return this.#tools.hasEditTool;
@@ -4346,6 +4406,11 @@ export class AgentSession {
 	/** Selects enabled tools, ignoring names absent from the registry. */
 	setActiveToolsByName(toolNames: string[]): Promise<void> {
 		return this.#tools.setActiveToolsByName(toolNames);
+	}
+
+	/** Snapshots the current tool set, applies a new one, and returns a restore handle. */
+	applyToolOverlay(toolNames: string[]): Promise<{ restore: () => Promise<void> }> {
+		return this.#tools.applyToolOverlay(toolNames);
 	}
 
 	/** Restores an exact top-level versus `xd://` tool partition. */
@@ -4870,8 +4935,16 @@ export class AgentSession {
 	}
 
 	#isScoutAvailable(): boolean {
-		const disabledAgents = this.settings.get("task.disabledAgents") as string[] | undefined;
-		return this.#scoutAllowedBySpawnPolicy && !disabledAgents?.includes("scout");
+		// Shared core with scoutAvailableForSession (tool descriptions) so the
+		// plan-mode/workflow advertisement cannot drift from the tool surfaces:
+		// spawn policy + disabledAgents, then the memoized discovery snapshot.
+		return scoutAvailableFromState(
+			this.settings.get("task.disabledAgents") as string[] | undefined,
+			this.#getSessionSpawns?.() ?? "*",
+			this.sessionManager.getCwd(),
+			this.getExtensionDiscoveryMode(),
+			this.extensionRoots,
+		);
 	}
 
 	async #buildPlanModeMessage(): Promise<CustomMessage | null> {
@@ -6426,6 +6499,24 @@ export class AgentSession {
 					...options,
 					additionalDirectories: this.settings.get("workspace.additionalDirectories"),
 				});
+				if (this.#agentPersona) {
+					this.sessionManager.appendAgentChange(
+						this.#agentPersona.name,
+						this.#agentPersona.source,
+						fingerprintAgentContent(this.#agentPersona),
+					);
+					// The persona's applied model (frontmatter model: or a
+					// previously switched model) lives in memory only; carry it
+					// into the new transcript so the next resume rehydrates it
+					// instead of falling back to the remembered default. Resume
+					// treats a recorded persona as rehydrated and intentionally
+					// does not reapply its frontmatter, so the JSONL must have
+					// the actual applied model.
+					const appliedModel = this.model;
+					if (appliedModel) {
+						this.sessionManager.appendModelChange(`${appliedModel.provider}/${appliedModel.id}`);
+					}
+				}
 				this.#bash.markSessionTransition(bashTransition);
 				// The new session owns the transcript from here, so the previous
 				// conversation's advisor spend is retired with it. Clearing at the commit
@@ -6617,6 +6708,122 @@ export class AgentSession {
 		options?: { ephemeral?: boolean },
 	): Promise<void> {
 		return this.#models.setModelTemporary(model, thinkingLevel, options);
+	}
+
+	/** Live-switches the agent persona: tools, spawns, model, thinking, system prompt. */
+	async switchAgentPersona(agent: AgentDefinition): Promise<void> {
+		if (agent.availability === "subagent") {
+			throw new Error(`Agent "${agent.name}" is subagent-only and cannot be selected as main persona.`);
+		}
+		// Enforce task.disabledAgents at this boundary, not just in the slash
+		// command and picker: SDK/extension code can call this method directly,
+		// and applying a persona the user disabled would bypass the same setting
+		// startup and /agent enforce.
+		const disabledAgents = this.settings.get("task.disabledAgents") as string[] | undefined;
+		if (disabledAgents?.includes(agent.name)) {
+			throw new Error(`Agent "${agent.name}" is disabled in settings (task.disabledAgents).`);
+		}
+		// Enforce the switch invariant at this boundary, not just in the slash
+		// command: SDK/extension code can call this method directly, and
+		// applying a persona while a turn is in flight (or while a mode still
+		// depends on its own tool overlay) would remove required mode tools or
+		// mutate the active request mid-stream.
+		if (this.isStreaming) {
+			throw new Error("Cannot switch agent while streaming.");
+		}
+		if (this.getPlanModeState()?.enabled) {
+			throw new Error("Cannot switch agent during plan mode. Exit plan mode first.");
+		}
+		if (this.getGoalModeState()?.enabled) {
+			throw new Error("Cannot switch agent during goal mode. Exit goal mode first.");
+		}
+		if (this.getVibeModeState()?.enabled) {
+			throw new Error("Cannot switch agent during vibe mode. Exit vibe mode first.");
+		}
+		const policy = resolveAgentSessionPolicy(agent);
+		const previousPersona = this.#agentPersona;
+		const previousOverlay = this.#agentToolOverlay;
+		const previousPersonaToolPolicy = this.#personaToolPolicy;
+		const previousModel = this.model;
+		const previousThinking = this.configuredThinkingLevel();
+		const previousToolNames = this.getEnabledToolNames();
+		const previousMounted = this.getMountedXdevToolNames();
+		const previousSpawns = this.#getSessionSpawns?.();
+		try {
+			// 1. Tools: overlay (skipped entirely when the CLI explicitly selected the
+			// tool set — the explicit CLI set is not a persona overlay).
+			if (!this.#cliToolsLocked) {
+				if (this.#agentToolOverlay) await this.#agentToolOverlay.restore();
+				if (policy.toolNames) {
+					this.#agentToolOverlay = await this.applyToolOverlay(policy.toolNames);
+				} else {
+					this.#agentToolOverlay = undefined;
+				}
+				this.#personaToolPolicy = this.#cliToolsLocked ? undefined : policy.toolNames;
+			} else {
+				this.#personaToolPolicy = undefined;
+			}
+			// 2. Spawns
+			if (policy.spawns !== undefined) this.#setSessionSpawns?.(policy.spawns);
+			// 3. Model (skipped when the CLI explicitly selected the model)
+			if (!this.#cliModelLocked && policy.modelPatterns?.length) {
+				const resolved = resolveModelOverride(policy.modelPatterns, this.modelRegistry, this.settings);
+				if (resolved.model) {
+					// setModel() re-applies the target model's default thinking
+					// and the inline model suffix may setThinkingLevel too —
+					// both would clobber an explicit CLI --thinking (locked,
+					// but no --model so #cliModelLocked is false). Capture the
+					// locked selector and restore it after the model lands.
+					const lockedThinking = this.#cliThinkingLocked ? this.configuredThinkingLevel() : undefined;
+					await this.setModel(resolved.model, "default");
+					if (lockedThinking !== undefined) this.setThinkingLevel(lockedThinking);
+					else if (resolved.thinkingLevel && !policy.thinkingLevel) {
+						this.setThinkingLevel(resolved.thinkingLevel);
+					}
+				} else {
+					// The persona declares a model that does not resolve (typo,
+					// disabled provider, missing extension model). `/agent`
+					// promises to apply the persona's model policy; silently
+					// keeping the previous model would persist an agent_change
+					// claiming the switch succeeded while the session runs on
+					// the wrong model. Fail before any persona change is
+					// recorded (the catch below rolls back the tool overlay).
+					throw new Error(
+						`Agent "${agent.name}" declares model "${policy.modelPatterns.join(", ")}" which does not resolve. ` +
+							`Fix the model: frontmatter or run "omp models" to see available models.`,
+					);
+				}
+				if (resolved.warning) this.emitNotice("warning", resolved.warning);
+			}
+			// 4. Thinking (skipped when the CLI explicitly selected thinking)
+			if (!this.#cliThinkingLocked && policy.thinkingLevel) this.setThinkingLevel(policy.thinkingLevel);
+			// 5. System prompt
+			this.#agentPersona = agent;
+			this.#setAgentPersona?.(agent);
+			await this.refreshBaseSystemPrompt();
+			// 6. Persist
+			this.sessionManager.appendAgentChange(agent.name, agent.source, fingerprintAgentContent(agent));
+			this.emitNotice("info", `Switched to agent persona "${agent.name}".`, "agent-switch");
+		} catch (error) {
+			this.#agentPersona = previousPersona;
+			this.#setAgentPersona?.(previousPersona);
+			this.#agentToolOverlay = previousOverlay;
+			this.#personaToolPolicy = previousPersonaToolPolicy;
+			try {
+				await this.setActiveToolPresentation(previousToolNames, previousMounted);
+				if (previousSpawns !== undefined) this.#setSessionSpawns?.(previousSpawns);
+				if (previousModel) await this.setModel(previousModel, "default");
+				this.setThinkingLevel(previousThinking);
+			} catch (rollbackError) {
+				logger.error("switchAgentPersona rollback failed", {
+					rollbackError: String(rollbackError),
+					agent: agent.name,
+					previousPersona: previousPersona?.name,
+					previousThinking,
+				});
+			}
+			throw error;
+		}
 	}
 
 	/** Cycles the scoped model set, or all available models when no scope exists. */
@@ -7481,6 +7688,10 @@ export class AgentSession {
 		const previousAutoThinking = this.isAutoThinking;
 		const previousAutoResolvedLevel = this.autoResolvedThinkingLevel();
 		const previousServiceTierByFamily = this.serviceTierByFamily;
+		const previousPersona = this.#agentPersona;
+		const previousPersonaOverlay = this.#agentToolOverlay;
+		const previousPersonaToolPolicy = this.#personaToolPolicy;
+		const previousSpawns = this.#getSessionSpawns?.();
 		const previousTools = [...this.agent.state.tools];
 		const previousBaseSystemPrompt = this.#tools.baseSystemPrompt;
 		const previousSystemPrompt = this.agent.state.systemPrompt;
@@ -7520,7 +7731,83 @@ export class AgentSession {
 			this.#syncAgentSessionId(undefined, false);
 			this.#memory.rekeyForCurrentSessionId();
 
+			// Reconcile the target transcript's persona: switchSession restores
+			// messages/model/thinking below but never consumed
+			// sessionContext.agentPersona, so an interactive /resume or tree
+			// switch kept the previous session's persona prompt/tools (or missed
+			// the target's) until a full restart. Apply the recorded persona's
+			// tools/spawns — but not its frontmatter model as a fresh selection:
+			// the transcript's own model_change is restored below and must win
+			// (mirrors main.ts agentRehydratedFromContext). When the target has
+			// no recorded persona (or it was deleted / became subagent-only /
+			// is now disabled), clear the previous persona's overlay and spawns
+			// back to the launch baseline.
 			let sessionContext = this.buildDisplaySessionContext();
+			// Hoisted out of the persona-reconcile block: the transcript model/
+			// thinking restore below runs after it, and a changed persona's
+			// model/thinking defaults must be reapplied AFTER that restore.
+			let targetPersona: AgentDefinition | undefined;
+			let targetPersonaContentChanged = false;
+			if (switchingToDifferentSession) {
+				const recorded = sessionContext.agentPersona;
+				// Captured for the changed-content check below: `persona` is only
+				// assigned when `recorded` is defined, but TS cannot narrow the
+				// sibling block, so read the fingerprint through the optional
+				// chain here.
+				const recordedFingerprint = recorded?.fingerprint;
+				let persona: AgentDefinition | undefined;
+				if (recorded) {
+					const discovery = await discoverAgents(this.sessionManager.getCwd(), undefined, {
+						includeExtensions: true,
+						extensionMode: this.getExtensionDiscoveryMode(),
+						extensionRoots: this.extensionRoots,
+					});
+					const candidate =
+						discovery.agents.find(a => a.name === recorded.agent && a.source === recorded.source) ??
+						getAgent(discovery.agents, recorded.agent);
+					const disabledAgents = this.settings.get("task.disabledAgents") as string[] | undefined;
+					if (candidate && candidate.availability !== "subagent" && !disabledAgents?.includes(candidate.name)) {
+						persona = candidate;
+					}
+				}
+				if (persona) {
+					const policy = resolveAgentSessionPolicy(persona);
+					// A persona whose definition content changed since the
+					// transcript recorded it (e.g. model:/thinkingLevel: edited)
+					// must have its new model/thinking defaults reapplied after
+					// the transcript restore below — a cold startup resume does
+					// this via the SDK persona block, but an in-process switch
+					// never did, silently running the stale model/thinking until
+					// the process restarted (codex 3742448937). The transcript
+					// entries still win when content is unchanged (the switch is
+					// a rehydrated selection, mirroring main.ts
+					// agentRehydratedFromContext).
+					targetPersona = persona;
+					targetPersonaContentChanged =
+						recordedFingerprint === undefined || recordedFingerprint !== fingerprintAgentContent(persona);
+					if (!this.#cliToolsLocked) {
+						if (this.#agentToolOverlay) await this.#agentToolOverlay.restore();
+						this.#agentToolOverlay = policy.toolNames ? await this.applyToolOverlay(policy.toolNames) : undefined;
+						this.#personaToolPolicy = policy.toolNames;
+					} else {
+						this.#personaToolPolicy = undefined;
+					}
+					if (policy.spawns !== undefined) this.#setSessionSpawns?.(policy.spawns);
+					this.#agentPersona = persona;
+					this.#setAgentPersona?.(persona);
+				} else {
+					// No recorded persona, deleted, subagent-only, or disabled:
+					// clear the previous persona's state to the launch baseline.
+					if (!this.#cliToolsLocked && this.#agentToolOverlay) {
+						await this.#agentToolOverlay.restore();
+						this.#agentToolOverlay = undefined;
+					}
+					this.#personaToolPolicy = undefined;
+					this.#setSessionSpawns?.(this.#baselineSpawns);
+					this.#agentPersona = undefined;
+					this.#setAgentPersona?.(undefined);
+				}
+			}
 			const didReloadConversationChange =
 				previousSessionContext !== undefined &&
 				didSessionMessagesChange(previousSessionContext.messages, sessionContext.messages);
@@ -7619,6 +7906,88 @@ export class AgentSession {
 				hasServiceTierEntry ? (sessionContext.serviceTier ?? {}) : configuredServiceTierByFamily,
 			);
 
+			// A persona whose definition content changed since the transcript was
+			// saved must reapply its model/thinking defaults AFTER the transcript
+			// restore above (which is authoritative for unchanged content). The
+			// switch is an explicit re-selection of the current definition — the
+			// same semantics as an explicit `--agent` cold resume — so its
+			// frontmatter model/thinking win over the stale transcript entries.
+			// setModel/setThinkingLevel persist their own transcript entries, so
+			// the next resume rehydrates the reapplied values instead of the
+			// stale ones (codex 3742448937).
+			if (targetPersonaContentChanged && targetPersona && switchingToDifferentSession) {
+				try {
+					const policy = resolveAgentSessionPolicy(targetPersona);
+					// Track whether the changed model policy was actually applied:
+					// when it cannot resolve (deleted provider, disabled
+					// extension), the transcript's restored model is kept, and
+					// recording the new fingerprint would mark the changed
+					// persona as rehydrated — the next resume would then skip
+					// reapplying the model even after the provider returns
+					// (codex 3742717639).
+					let modelPolicyApplied = true;
+					if (!this.#cliModelLocked && policy.modelPatterns?.length) {
+						const resolved = resolveModelOverride(policy.modelPatterns, this.modelRegistry, this.settings);
+						if (resolved.model) {
+							// Skip setModel when it equals the restored transcript
+							// model: ModelControls.setModel would still append a
+							// duplicate model_change and reapply thinking. The
+							// inline suffix still applies — a `model:` edit from
+							// `provider/id` to `provider/id:high` changes only
+							// the thinking and must not leave the stale
+							// transcript selector in place (codex 3742662984).
+							if (!this.model || !modelsAreEqual(this.model, resolved.model)) {
+								const lockedThinking = this.#cliThinkingLocked ? this.configuredThinkingLevel() : undefined;
+								await this.setModel(resolved.model, "default");
+								if (lockedThinking !== undefined) this.setThinkingLevel(lockedThinking);
+								else if (resolved.thinkingLevel && !policy.thinkingLevel) {
+									this.setThinkingLevel(resolved.thinkingLevel);
+								}
+							} else if (resolved.thinkingLevel && !policy.thinkingLevel && !this.#cliThinkingLocked) {
+								this.setThinkingLevel(resolved.thinkingLevel);
+							}
+							if (resolved.warning) this.emitNotice("warning", resolved.warning);
+						} else {
+							// Unresolvable after a switch (deleted provider,
+							// disabled extension): keep the restored model rather
+							// than failing the whole switch — the persona's
+							// tools/spawns already committed above.
+							logger.warn("Persona model did not resolve during session switch", {
+								agent: targetPersona.name,
+								modelPatterns: policy.modelPatterns,
+							});
+							modelPolicyApplied = false;
+						}
+					}
+					// Thinking: apply the persona's frontmatter level — a fresh
+					// selection for changed content. Unchanged personas restored
+					// the transcript entries above and never reach this branch.
+					// Skip when an explicit CLI thinking is locked.
+					if (!this.#cliThinkingLocked && policy.thinkingLevel) {
+						this.setThinkingLevel(policy.thinkingLevel);
+					}
+					// Record the current definition's fingerprint so the next
+					// resume's identity check compares against this content, not
+					// the stale recorded one — but only after the changed model
+					// policy was actually applied. An unresolved model leaves
+					// the old fingerprint in place so the next resume retries
+					// the reapply once the provider is available again.
+					if (modelPolicyApplied) {
+						this.sessionManager.appendAgentChange(
+							targetPersona.name,
+							targetPersona.source,
+							fingerprintAgentContent(targetPersona),
+						);
+					}
+				} catch (applyError) {
+					logger.warn("Failed to reapply changed persona model/thinking after session switch", {
+						targetSessionFile: sessionPath,
+						agent: targetPersona.name,
+						error: String(applyError),
+					});
+				}
+			}
+
 			if (switchingToDifferentSession) {
 				await this.#memory.resetContextForNewTranscript();
 			}
@@ -7699,6 +8068,40 @@ export class AgentSession {
 			}
 			this.#models.restoreThinkingSnapshot(previousThinkingLevel, previousAutoThinking, previousAutoResolvedLevel);
 			this.#models.restoreServiceTiers(previousServiceTierByFamily);
+			this.#agentPersona = previousPersona;
+			this.#setAgentPersona?.(previousPersona);
+			// The forward path may have already run the target persona's overlay
+			// (restore + applyToolOverlay), which rewrote SessionTools'
+			// presentation state (#runtimeSelectedToolNames, #xdev.mountedNames,
+			// #lastAppliedToolSignature). Reassigning the handle alone would leave
+			// the rolled-back source session on the target's mount partition and
+			// pin set. Restore whichever overlay was APPLIED (the target's handle,
+			// when the persona block ran — including when the source had no
+			// persona of its own and previousPersonaOverlay is undefined), then
+			// re-point the handle at the source baseline.
+			const appliedOverlay = this.#agentToolOverlay;
+			this.#agentToolOverlay = previousPersonaOverlay;
+			if (appliedOverlay && appliedOverlay !== previousPersonaOverlay) {
+				try {
+					await appliedOverlay.restore();
+				} catch (restoreError) {
+					logger.warn("Failed to restore applied tool overlay after session switch rollback", {
+						targetSessionFile: sessionPath,
+						error: String(restoreError),
+					});
+				}
+			} else if (previousPersonaOverlay) {
+				try {
+					await previousPersonaOverlay.restore();
+				} catch (restoreError) {
+					logger.warn("Failed to restore persona tool overlay after session switch rollback", {
+						targetSessionFile: sessionPath,
+						error: String(restoreError),
+					});
+				}
+			}
+			this.#personaToolPolicy = previousPersonaToolPolicy;
+			if (previousSpawns !== undefined) this.#setSessionSpawns?.(previousSpawns);
 			if (modelRolledBack) {
 				this.#emit({ type: "model_changed" });
 			}

@@ -227,6 +227,14 @@ export interface SessionInitEntry extends SessionEntryBase {
 	spawns?: string;
 	/** The agent's `readSummarize` setting (`false` = read summarization disabled); absent uses the session default. */
 	readSummarize?: boolean;
+	/**
+	 * Whether the parent session ran with extension discovery disabled
+	 * (`--no-extensions`, root mode "explicit-only"). Persisted so a cold
+	 * revive rebuilds the same root scope instead of defaulting to merge mode.
+	 */
+	disableExtensionDiscovery?: boolean;
+	/** Parent's resolved explicit extension-package root directories (agent/skill discovery scope). */
+	extensionRoots?: string[];
 }
 
 /** Mode change entry - tracks agent mode transitions (e.g. plan mode). */
@@ -236,6 +244,23 @@ export interface ModeChangeEntry extends SessionEntryBase {
 	mode: string;
 	/** Optional mode-specific data (e.g. plan file path) */
 	data?: Record<string, unknown>;
+}
+
+/** Agent persona change entry - tracks main-session agent persona selection for resume. */
+export interface AgentChangeEntry extends SessionEntryBase {
+	type: "agent_change";
+	/** Agent name (from AgentDefinition.name). */
+	agent: string;
+	/** Agent source for disambiguation (mirrors task/types.ts AgentSource). */
+	source: "bundled" | "user" | "project";
+	/**
+	 * Content fingerprint of the persona definition at save time (system
+	 * prompt, tools, model patterns, thinking level). On resume it lets the
+	 * SDK drop the inherited provider prompt-cache key when the same
+	 * name/source now resolves to a definition whose content changed; absent
+	 * on legacy transcripts, where the conservative path also applies.
+	 */
+	fingerprint?: string;
 }
 
 /**
@@ -275,6 +300,7 @@ export type SessionEntry =
 	| TtsrInjectionEntry
 	| SessionInitEntry
 	| ModeChangeEntry
+	| AgentChangeEntry
 	| CredentialPinEntry
 	| ResetBoundaryEntry;
 

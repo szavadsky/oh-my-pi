@@ -214,6 +214,25 @@ test("explicit-only CLI roots replace stale state and exclude every ambient pack
 	).toBe(false);
 });
 
+test("an explicit empty extension-root list stays authoritative over CLI/ALS roots", async () => {
+	// Restricted subagents pass `preloadedExtensionRoots: []` to mean "no
+	// package roots" — they must not inherit the parent's `-e`/settings roots.
+	// A truthiness check on `.length` would treat the explicit empty list as
+	// absent and fall back to the injected CLI roots, leaking the parent's
+	// extension agents into the restricted session (codex 3742662987).
+	const cliRoot = path.join(tempDir, "cli-extension");
+	buildExtensionPackage(cliRoot, "cli-skill");
+	injectOmpExtensionCliRoots([cliRoot], home, project);
+
+	const roots = await listOmpExtensionRoots(ctx(), { explicitRoots: [] });
+	expect(roots).toHaveLength(0);
+
+	// Without the explicit override the CLI root is still visible — proving
+	// the empty list, not the environment, suppressed it.
+	const ambientRoots = await listOmpExtensionRoots(ctx());
+	expect(ambientRoots.map(root => root.path)).toEqual([cliRoot]);
+});
+
 test("invocation scopes isolate concurrent SDK roots and merge ambient roots only when requested", async () => {
 	const otherExplicit = path.join(tempDir, "other-explicit-extension");
 	const projectExt = path.join(tempDir, "project-extension");

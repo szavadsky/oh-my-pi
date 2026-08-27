@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Settings } from "../../src/config/settings";
 import initAgentPrompt from "../../src/prompts/agents/init.md" with { type: "text" };
+import { fingerprintAgentContent } from "../../src/task/agent-policy";
 import * as taskDiscovery from "../../src/task/discovery";
 import { TaskTool } from "../../src/task/index";
 import { isScoutSpawnable } from "../../src/task/spawn-policy";
+import { resolveEffectiveSubagentPolicy, StructuredSubagentError } from "../../src/task/structured-subagent";
 import type { AgentDefinition } from "../../src/task/types";
 import { getTaskSchema } from "../../src/task/types";
 import type { ToolSession } from "../../src/tools";
@@ -42,6 +44,21 @@ describe("task spawn policy surfaces", () => {
 		vi.restoreAllMocks();
 	});
 
+	it("includes the spawns policy in the persona content fingerprint", () => {
+		// A spawns-only frontmatter edit changes the task/scout prompt text, so
+		// the provider prompt-cache key must be invalidated on resume — the
+		// fingerprint hashes everything that shapes that text (codex 3741758350).
+		const base = {
+			name: "spawns-fp",
+			description: "Persona",
+			systemPrompt: "Body.",
+			source: "project" as const,
+		};
+		const unrestricted = fingerprintAgentContent(base);
+		const restricted = fingerprintAgentContent({ ...base, spawns: ["scout"] });
+		expect(restricted).not.toBe(unrestricted);
+	});
+
 	it("uses the first allowed spawn as the schema default", () => {
 		const schema = getTaskSchema({ isolationEnabled: false, batchEnabled: false, defaultAgent: "fact-finder" });
 		const parsed = schema({ task: "check" });
@@ -60,6 +77,90 @@ describe("task spawn policy surfaces", () => {
 
 		expect(description).toContain("### fact-finder");
 		expect(description).not.toContain("### oracle");
+	});
+});
+
+describe("resolveEffectiveSubagentPolicy primary-only rejection", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("allows all/subagent agents at preflight", async () => {
+		const allAgent = {
+			name: "all-agent",
+			description: "",
+			systemPrompt: "",
+			availability: "all" as const,
+			source: "project" as const,
+		} satisfies AgentDefinition;
+
+		const subAgent = {
+			name: "sub-agent",
+			description: "",
+			systemPrompt: "",
+			availability: "subagent" as const,
+			source: "project" as const,
+		} satisfies AgentDefinition;
+
+		vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({
+			agents: [allAgent, subAgent],
+			projectAgentsDir: null,
+		});
+
+		const session = makeSession("*");
+
+		await expect(
+			resolveEffectiveSubagentPolicy({
+				session,
+				invocationKind: "task",
+				assignment: "do something",
+				agent: "all-agent",
+			}),
+		).resolves.toBeDefined();
+
+		await expect(
+			resolveEffectiveSubagentPolicy({
+				session,
+				invocationKind: "task",
+				assignment: "do something",
+				agent: "sub-agent",
+			}),
+		).resolves.toBeDefined();
+	});
+
+	it("rejects primary-only agent", async () => {
+		const primaryOnlyAgent = {
+			name: "primary-only",
+			description: "",
+			systemPrompt: "",
+			availability: "primary" as const,
+			source: "project" as const,
+		} satisfies AgentDefinition;
+
+		vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({
+			agents: [primaryOnlyAgent],
+			projectAgentsDir: null,
+		});
+
+		const session = makeSession("*");
+
+		await expect(
+			resolveEffectiveSubagentPolicy({
+				session,
+				invocationKind: "task",
+				assignment: "do something",
+				agent: "primary-only",
+			}),
+		).rejects.toThrow(StructuredSubagentError);
+
+		await expect(
+			resolveEffectiveSubagentPolicy({
+				session,
+				invocationKind: "task",
+				assignment: "do something",
+				agent: "primary-only",
+			}),
+		).rejects.toThrow(/primary-only/);
 	});
 });
 

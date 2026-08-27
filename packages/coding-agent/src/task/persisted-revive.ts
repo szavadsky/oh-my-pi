@@ -123,6 +123,13 @@ export function createPersistedSubagentReviverFactory(
 				// Old files predate persisted spawns: deny re-spawning rather than let
 				// createAgentSession default to wildcard ("*").
 				spawns: init.spawns ?? "",
+				// Rebuild the parent's extension root scope: without this a cold
+				// revive defaults to merge mode with no explicit roots and re-discovers
+				// ambient plugin agents the parent (--no-extensions / SDK paths) was
+				// forbidden from seeing. Mirrors the live reviver, which forwards both
+				// through buildSubagentSessionOptions.
+				disableExtensionDiscovery: init.disableExtensionDiscovery,
+				preloadedExtensionRoots: init.extensionRoots,
 				hasUI: false,
 				enableLsp: restrictToolNames ? false : ctx.enableLsp,
 				...(restrictToolNames

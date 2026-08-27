@@ -266,12 +266,12 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 		expect(created.planModeEnabled).toBe(false);
 		expect(session?.getPlanModeState()).toBeUndefined();
 		expect(session?.model?.id).toBe(previousModel?.id);
-		// Pre-existing successful-exit behavior (unchanged by this fix): restoring the
-		// pre-plan tool set drops the MCP device and plan-only selections entirely.
-		expect(session?.getActiveToolNames()).toEqual(["read"]);
-		expect(session?.getMountedXdevToolNames()).toEqual([]);
+		// Successful exit restores the exact pre-plan tool set via the overlay
+		// handle: plan augmentations and the mounted partition survive.
+		expect(session?.getActiveToolNames()).toEqual(planActiveTools);
+		expect(session?.getMountedXdevToolNames()).toEqual(planMountedTools);
 		expect(xdev.tools.has(mountedTool.name)).toBe(true);
-		expect(resolveXdevTool(xdev, mountedTool.name)).toBeUndefined();
+		expect(resolveXdevTool(xdev, mountedTool.name)).toBeDefined();
 	});
 
 	it("clears old plan UI state when target-session reconciliation restore fails", async () => {
