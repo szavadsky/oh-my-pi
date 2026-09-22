@@ -39,6 +39,7 @@ import {
 	formatModelStringWithRouting,
 	getModelMatchPreferences,
 	resolveCliModel,
+	resolveAgentModelSelection,
 	resolveConfiguredModelPatterns,
 	type ResolveCliModelResult,
 	resolveModelRoleValue,
@@ -1810,6 +1811,43 @@ export async function buildSessionOptions(
 		else if (parsed.noTools) explicit.tools = [];
 		if (Object.keys(explicit).length > 0) {
 			options.pendingPersonaExplicit = explicit;
+		}
+		// Ordered runtime model fallback (task-subagent parity): with no explicit
+		// CLI `--model`/`--models`, the persona's full expanded model list becomes
+		// the deferred pattern chain — the first available selector starts the
+		// session at its own effort and the rest install as its runtime retry
+		// chain under a persona-scoped role. Explicit CLI flags keep winning, and
+		// a persona without a declared model list leaves startup selection alone.
+		if (agent && (agent.model?.length ?? 0) > 0 && !parsed.model && (parsed.models?.length ?? 0) === 0) {
+			const { patterns, role } = resolveAgentModelSelection({
+				agentModel: agent.model,
+				settings: activeSettings,
+			});
+			if (patterns.length > 0) {
+				options.model = undefined;
+				options.thinkingLevel = undefined;
+				options.modelPattern = patterns;
+				options.modelPatternFallbackRole = `persona:${agent.name}`;
+				if (agent.thinkingLevel !== undefined) {
+					options.modelPatternDefaultThinkingLevel = agent.thinkingLevel;
+				}
+				// A single expanded pattern carries a default retry chain: the
+				// source role's configured chain when the pattern came from a role
+				// alias (an explicitly empty role chain stays empty — no fallback),
+				// else the configured default chain.
+				if (patterns.length === 1) {
+					const chains = activeSettings.get("retry.fallbackChains");
+					options.modelPatternDefaultFallbackChain =
+						(role !== undefined ? chains?.[role] : undefined) ?? chains?.default;
+				}
+			}
+		}
+		// Launch-time structured output: a persona `output` schema starts the
+		// session with structured completion and an enforced `yield` tool. Live
+		// `/agent` switching state is untouched.
+		if (agent?.output !== undefined) {
+			options.outputSchema = agent.output;
+			options.requireYieldTool = true;
 		}
 	}
 	// Per-workspace re-derivation hook for ACP (relative extension spellings):

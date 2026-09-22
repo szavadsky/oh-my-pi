@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added `--agent` and `/agent` to run a discovered agent definition as the main-session persona (tools, model, thinking, spawns, system prompt), restorable on exit and across resume ([#6836](https://github.com/can1357/oh-my-pi/issues/6836), [#5306](https://github.com/can1357/oh-my-pi/issues/5306), [#7056](https://github.com/can1357/oh-my-pi/issues/7056)).
+- Added `--agent` and `/agent` to run a discovered agent definition as the main-session persona (tools, model, thinking, spawns, system prompt), restorable on exit and across resume. The agent's `model` list now applies as an ordered runtime fallback chain — the first available selector starts the session at its own `:effort`, the rest serve as retry fallbacks under a `persona:<name>` role, and `@role` aliases inherit the role's configured chain — while a persona `output:` schema enables launch-time structured output with an enforced `yield` tool ([#6836](https://github.com/can1357/oh-my-pi/issues/6836), [#5306](https://github.com/can1357/oh-my-pi/issues/5306), [#7056](https://github.com/can1357/oh-my-pi/issues/7056), [#11004](https://github.com/can1357/oh-my-pi/issues/11004)).
 ### Breaking Changes
 
 - Removed support for the env parameter in the bash tool

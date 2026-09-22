@@ -444,6 +444,8 @@ export interface CreateAgentSessionOptions {
 	modelPatternFallbackRole?: string;
 	/** Validated default retry chain to install when a deferred singleton pattern resolves. */
 	modelPatternDefaultFallbackChain?: string[];
+	/** Thinking default applied when a deferred pattern resolves without its own explicit `:level` suffix (e.g. an agent's `thinkingLevel` frontmatter); sits below explicit suffixes and above role/model/global defaults. */
+	modelPatternDefaultThinkingLevel?: ConfiguredThinkingLevel;
 	/** Thinking selector. Default: from settings, else unset */
 	thinkingLevel?: ConfiguredThinkingLevel;
 	/** Hard ceiling on the session's thinking effort (e.g. a task spawn's `task.maxEffort`-capped hint); retry-fallback recovery re-clamps to it. */
@@ -1672,6 +1674,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		}
 		if (level === undefined && !hasThinkingEntry && restoredSessionThinkingLevel !== undefined) {
 			level = restoredSessionThinkingLevel;
+		}
+		// Deferred-pattern default (e.g. an agent persona's `thinkingLevel`
+		// frontmatter): applies only when the selected pattern carried no
+		// explicit `:level` suffix (that landed via `restoredSessionThinkingLevel`
+		// above) and no explicit option/session level exists — above the
+		// default-role, model defaultLevel, and global settings fallbacks.
+		if (level === undefined && options.modelPatternDefaultThinkingLevel !== undefined) {
+			level = options.modelPatternDefaultThinkingLevel;
 		}
 		if (level === undefined && !hasExplicitModel && !hasThinkingEntry && defaultRoleSpec.explicitThinkingLevel) {
 			level = defaultRoleSpec.thinkingLevel;
