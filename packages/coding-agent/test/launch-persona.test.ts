@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -43,6 +44,38 @@ model:
 ---
 
 You are the modeled persona.`;
+
+const FALLBACK_AGENT_MD = `---
+name: fixture-fallback
+description: Persona with an ordered model fallback chain and structured output
+model:
+  - "no-such-provider-xyz/missing-model-7k2:max"
+  - anthropic/claude-sonnet-4-5:high
+  - anthropic/claude-opus-4-1:low
+thinkingLevel: medium
+tools:
+  - read
+output:
+  type: object
+  properties:
+    status:
+      type: string
+  required:
+    - status
+spawns: []
+---
+
+You are the fallback persona.`;
+
+const TASK_ALIAS_AGENT_MD = `---
+name: fixture-task-alias
+description: Persona inheriting the task role alias
+model:
+  - "@task"
+thinkingLevel: high
+---
+
+You are the task alias persona.`;
 
 let workspace: TempDir;
 let authStorage: AuthStorage;
@@ -438,5 +471,99 @@ You are the wide persona.`,
 		);
 		expect(desired?.name).toBe("fixture-wide");
 		expect(desired?.explicit?.tools).toEqual(["read", "write"]);
+	});
+
+	// Launch parity with task subagents (PR 12783 onto 11004): the persona's
+	// full ordered model list becomes a deferred modelPattern chain — a missing
+	// selector skips, the first available one selects, its explicit effort wins
+	// over the persona thinking default, and the remaining selectors install as
+	// the runtime retry fallback under a persona-scoped role.
+	it("buildSessionOptions turns the persona model list into an ordered deferred pattern chain", async () => {
+		await writeFixtureAgents({ name: "fixture-fallback.md", content: FALLBACK_AGENT_MD });
+		const parsed = parseArgs(["--cwd", workspace.path(), "--agent", "fixture-fallback"]);
+		const options = await buildSessionOptions(
+			parsed,
+			[],
+			SessionManager.inMemory(),
+			modelRegistry,
+			Settings.isolated(),
+		);
+
+		expect(options.pendingPersonaAgent?.name).toBe("fixture-fallback");
+		expect(options.model).toBeUndefined();
+		expect(options.modelPattern).toEqual([
+			"no-such-provider-xyz/missing-model-7k2:max",
+			"anthropic/claude-sonnet-4-5:high",
+			"anthropic/claude-opus-4-1:low",
+		]);
+		expect(options.modelPatternFallbackRole).toBe("persona:fixture-fallback");
+		// The persona thinking default rides the DEFERRED pattern default only —
+		// an explicit selector suffix must still outrank it after resolution.
+		expect(options.modelPatternDefaultThinkingLevel).toBe(ThinkingLevel.Medium);
+		expect(options.thinkingLevel).toBeUndefined();
+		expect(options.outputSchema).toEqual({
+			type: "object",
+			properties: { status: { type: "string" } },
+			required: ["status"],
+		});
+		expect(options.requireYieldTool).toBe(true);
+	});
+
+	it("launch selects the first available selector at its explicit effort and installs the rest as fallback", async () => {
+		await writeFixtureAgents({ name: "fixture-fallback.md", content: FALLBACK_AGENT_MD });
+		const settings = Settings.isolated();
+		const launched = await launch({ args: ["--agent", "fixture-fallback"], extraOptions: { settings } });
+
+		// The missing first selector skips; the second resolves and its explicit
+		// `:high` effort beats the persona's `thinkingLevel: medium` default.
+		expect(launched.model?.provider).toBe("anthropic");
+		expect(launched.model?.id).toBe("claude-sonnet-4-5");
+		expect(launched.configuredThinkingLevel()).toBe(ThinkingLevel.High);
+
+		// Structured output activates yield alongside the persona's own tools.
+		const enabled = new Set(launched.getEnabledToolNames());
+		expect(enabled.has("read")).toBe(true);
+		expect(enabled.has("yield")).toBe(true);
+
+		// The third selector installs as the persona role's runtime retry chain —
+		// read back through the same Settings instance the session was built with.
+		const chains = settings.get("retry.fallbackChains");
+		expect(chains?.["persona:fixture-fallback"]).toContain("anthropic/claude-opus-4-1:low");
+	});
+
+	// Role-alias parity: a persona declaring `model: @task` expands through
+	// resolveAgentModelSelection exactly like a task spawn, inheriting the
+	// task role's configured retry fallback chain.
+	it("a role-alias persona inherits the role's configured fallback chain", async () => {
+		await writeFixtureAgents({ name: "fixture-task-alias.md", content: TASK_ALIAS_AGENT_MD });
+		const settings = Settings.isolated();
+		settings.setModelRole("task", "zai/glm-5.3:high");
+		settings.override("retry.fallbackChains", {
+			task: ["zai/glm-5.3-flash:max", "anthropic/claude-haiku-4-5:low"],
+		});
+		const parsed = parseArgs(["--cwd", workspace.path(), "--agent", "fixture-task-alias"]);
+		const options = await buildSessionOptions(parsed, [], SessionManager.inMemory(), modelRegistry, settings);
+
+		expect(options.modelPattern).toEqual(["zai/glm-5.3:high"]);
+		expect(options.modelPatternFallbackRole).toBe("persona:fixture-task-alias");
+		expect(options.modelPatternDefaultThinkingLevel).toBe(ThinkingLevel.High);
+		expect(options.modelPatternDefaultFallbackChain).toEqual([
+			"zai/glm-5.3-flash:max",
+			"anthropic/claude-haiku-4-5:low",
+		]);
+	});
+
+	// A single plain (non-role) pattern inherits the configured DEFAULT retry
+	// chain as its fallback when no role-specific chain applies.
+	it("a single-model persona inherits the default fallback chain", async () => {
+		await writeFixtureAgents({ name: "fixture-modeled.md", content: MODELED_AGENT_MD });
+		const settings = Settings.isolated();
+		settings.override("retry.fallbackChains", { default: ["zai/glm-5.3-flash:max"] });
+		const parsed = parseArgs(["--cwd", workspace.path(), "--agent", "fixture-modeled"]);
+		const options = await buildSessionOptions(parsed, [], SessionManager.inMemory(), modelRegistry, settings);
+
+		expect(options.modelPattern).toEqual(["anthropic/claude-sonnet-4-5"]);
+		expect(options.modelPatternFallbackRole).toBe("persona:fixture-modeled");
+		expect(options.modelPatternDefaultFallbackChain).toEqual(["zai/glm-5.3-flash:max"]);
 	});
 });

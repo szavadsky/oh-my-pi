@@ -130,6 +130,11 @@ export function createDefaultPersonaModelHooks(session: AgentSession): PersonaMo
 			// value ends in `:level`). Capture it and adopt it below when the
 			// persona's own frontmatter declared none.
 			const resolvedThinking: Array<ConfiguredThinkingLevel | undefined> = [];
+			// Task-subagent precedence: an explicit `:level` suffix on the
+			// selected agent model is an explicit selector effort — it outranks
+			// the persona's `thinkingLevel` frontmatter (which only backs
+			// patterns that carry no suffix).
+			let agentPatternExplicitThinking: ConfiguredThinkingLevel | undefined;
 			const explicitModelPattern = explicit?.model?.trim();
 			if (explicitModelPattern) {
 				const resolved = await resolveWithDiscoveryRetry([explicitModelPattern], session);
@@ -140,8 +145,23 @@ export function createDefaultPersonaModelHooks(session: AgentSession): PersonaMo
 			} else if (agent.model && agent.model.length > 0) {
 				const resolved = await resolveWithDiscoveryRetry(agent.model, session);
 				if (resolved.model) {
-					await session.setModel(resolved.model);
+					// Deferred startup may have already selected this same model
+					// (the persona chain's first available selector). A redundant
+					// setModel re-records a model_change and clobbers the synthetic
+					// `persona:<name>` role + active retry chain — skip it when
+					// provider/id already match.
+					const current = session.model;
+					const alreadySelected =
+						current !== undefined &&
+						current.provider === resolved.model.provider &&
+						current.id === resolved.model.id;
+					if (!alreadySelected) {
+						await session.setModel(resolved.model);
+					}
 					resolvedThinking.push(resolved.thinkingLevel);
+					if (resolved.explicitThinkingLevel) {
+						agentPatternExplicitThinking = resolved.thinkingLevel;
+					}
 				}
 			}
 			const explicitThinking =
@@ -154,6 +174,7 @@ export function createDefaultPersonaModelHooks(session: AgentSession): PersonaMo
 			const thinking: ConfiguredThinkingLevel | undefined =
 				explicitThinking ??
 				explicitModelThinking ??
+				agentPatternExplicitThinking ??
 				(agent.thinkingLevel !== undefined
 					? agent.thinkingLevel
 					: explicitModelPattern

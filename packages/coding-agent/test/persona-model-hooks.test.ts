@@ -219,9 +219,11 @@ test("apply adopts the agent pattern's thinking suffix when frontmatter declares
 	expect(stub.state.thinkingLevel).toBe(ThinkingLevel.High);
 });
 
-// j2v precedence: an explicit override model pattern with a thinking suffix
-// loses to the persona's own declared thinkingLevel.
-test("apply keeps frontmatter thinking over the resolved pattern suffix", async () => {
+// Task-subagent precedence (PR 12783 parity): an explicit `:level` suffix on
+// the agent's selected model BEATS the persona's own thinkingLevel — the
+// suffix is an explicit selector effort, the frontmatter level only backs
+// patterns that carry none.
+test("apply keeps the selected pattern's explicit suffix over the frontmatter thinking", async () => {
 	const stub = makeStubSession({
 		model: BASELINE_MODEL,
 		thinkingLevel: ThinkingLevel.Medium,
@@ -229,7 +231,7 @@ test("apply keeps frontmatter thinking over the resolved pattern suffix", async 
 	const hooks = createDefaultPersonaModelHooks(stubRegistry(stub.session));
 	await hooks.apply(makeAgent({ model: ["stub/claude-persona:high"], thinkingLevel: ThinkingLevel.Low }));
 	expect(stub.state.model).toBe(PERSONA_MODEL);
-	expect(stub.state.thinkingLevel).toBe(ThinkingLevel.Low);
+	expect(stub.state.thinkingLevel).toBe(ThinkingLevel.High);
 });
 
 // j2v: an explicit override's pattern suffix adopts when nothing else
